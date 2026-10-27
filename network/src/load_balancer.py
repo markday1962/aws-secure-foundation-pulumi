@@ -46,6 +46,10 @@ class LoadBalancer(pulumi.ComponentResource):
     def __init__(self, name: str, args: LoadBalancerArgs, opts: pulumi.ResourceOptions | None = None):
         super().__init__("learning:network:LoadBalancer", name, {}, opts)
 
+        # AWS requires an ALB to span at least two availability zones.
+        if len(args.subnet_ids) < 2:
+            raise ValueError(f"an ALB needs subnets in at least two availability zones, got {len(args.subnet_ids)}")
+
         child_opts = pulumi.ResourceOptions(parent=self)
 
         # ── Certificate: ACM, validated by a DNS record in the hosted zone.

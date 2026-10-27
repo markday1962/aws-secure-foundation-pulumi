@@ -11,38 +11,54 @@ config:
       environment: dev
       managed-by: pulumi
 
-  # ── Always deployed: the VPC, its subnets and route tables, and the
-  # locked-down default security group and network ACL.
+  # The VPC's address range and AZs. Every tier's subnets have fixed addresses
+  # in it, whether or not the tier is deployed.
   highly-secure-foundation-network:vpcCidr: 10.0.0.0/16
   highly-secure-foundation-network:availabilityZones:
     - eu-west-1a
     - eu-west-1b
     - eu-west-1c
 
-  # ── Everything else is off. Switch features on one `pulumi up` at a time,
-  # roughly in this order; the stack refuses a feature whose dependencies are
-  # off. Until networkAcls is on, every subnet uses the deny-all default ACL.
+  # ── Everything is off, so `pulumi up` deploys nothing. Switch features on
+  # one `pulumi up` at a time, roughly in this order; the stack refuses a
+  # feature whose dependencies are off. Until networkAcls is on, every subnet
+  # uses the deny-all default ACL.
   #
-  #   1. networkAcls, securityGroups, flowLogs     free (flow logs: log volume)
-  #   2. internetGateway, gatewayEndpoints         free
-  #   3. natGateways                               ~$35/month each
-  #   4. interfaceEndpoints                        ~$8/month each per AZ
-  #   5. loadBalancer                              ~$18/month + LCUs
-  #   6. waf                                       ~$20/month + per request
+  #   1. vpc                                       free (protected once deployed)
+  #   2. publicSubnets, appSubnets, dataSubnets    free
+  #   3. networkAcls, securityGroups, flowLogs     free (flow logs: log volume)
+  #   4. internetGateway, gatewayEndpoints         free
+  #   5. natGateways                               ~$35/month each
+  #   6. interfaceEndpoints                        ~$8/month each per AZ
+  #   7. loadBalancer                              ~$18/month + LCUs
+  #   8. waf                                       ~$20/month + per request
+  #
+  # The VPC, with its default security group and network ACL stripped of
+  # every rule. Protected: switching it off later fails until you run
+  # `pulumi state unprotect` on it (see the README).
+  highly-secure-foundation-network:vpc: false
+  # Subnets per tier, one per AZ, with their route tables. Each needs vpc.
+  highly-secure-foundation-network:publicSubnets: false
+  highly-secure-foundation-network:appSubnets: false
+  highly-secure-foundation-network:dataSubnets: false
+  # Each needs vpc.
   highly-secure-foundation-network:networkAcls: false
   highly-secure-foundation-network:securityGroups: false
   highly-secure-foundation-network:flowLogs: false
+  # Needs publicSubnets.
   highly-secure-foundation-network:internetGateway: false
+  # Needs appSubnets and networkAcls.
   highly-secure-foundation-network:gatewayEndpoints: false
   # "none", "single" (one NAT shared by all AZs) or "perAz" (one per AZ, survives
-  # an AZ outage). Needs internetGateway and networkAcls.
+  # an AZ outage). Needs publicSubnets, appSubnets, internetGateway and networkAcls.
   highly-secure-foundation-network:natGateways: none
-  # Interface endpoint services. Needs networkAcls and securityGroups. ssm,
+  # Interface endpoint services. Needs appSubnets, networkAcls and securityGroups. ssm,
   # ssmmessages and ec2messages give Session Manager shell access with no SSH
   # and no bastion. The full set, to switch on:
   #   [ssm, ssmmessages, ec2messages, sts, kms, logs, secretsmanager, ecr.api, ecr.dkr, sqs]
   highly-secure-foundation-network:interfaceEndpoints: []
-  # Needs internetGateway, networkAcls and securityGroups.
+  # Needs publicSubnets, internetGateway, networkAcls and securityGroups, and
+  # at least two availabilityZones.
   highly-secure-foundation-network:loadBalancer: false
   # Needs loadBalancer.
   highly-secure-foundation-network:waf: false
