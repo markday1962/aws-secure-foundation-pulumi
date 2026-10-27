@@ -8,6 +8,14 @@ from src.network import Network, NetworkArgs
 config = pulumi.Config()
 aws_config = pulumi.Config("aws")
 
+# Every physical name (buckets, trail, log groups, KMS aliases, security
+# groups, the ALB) starts with this, so stacks can share an account. The ALB's
+# 32-character name limit caps the stack name at 10 characters.
+stack = pulumi.get_stack()
+if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,9}", stack):
+    raise ValueError(f'stack name must be 1-10 lowercase letters, digits or hyphens, got "{stack}"')
+prefix = f"learning-{stack}"
+
 # The account this stack is pinned to. The provider refuses to run against
 # any other, and policies use it to scope access to this account only.
 allowed_account_ids = aws_config.require_object("allowedAccountIds")
@@ -24,7 +32,7 @@ app_port = config.get_int("appPort", default=8443)
 log_retention_days = config.get_int("logRetentionDays", default=365)
 
 network = Network(
-    "learning",
+    prefix,
     NetworkArgs(
         account_id=account_id,
         region=region,
@@ -40,7 +48,7 @@ network = Network(
 
 domain_name = config.require("domainName")
 alb = LoadBalancer(
-    "learning-alb",
+    f"{prefix}-alb",
     LoadBalancerArgs(
         account_id=account_id,
         region=region,

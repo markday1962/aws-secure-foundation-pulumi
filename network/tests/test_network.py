@@ -168,6 +168,7 @@ class TestNetwork:
         assert flow["trafficType"] == "ALL"
         assert flow["logFormat"].startswith("${version} ${account-id} ")
         group = registered("aws:cloudwatch/logGroup:LogGroup", "t-flow")
+        assert group["name"] == "/t/vpc/flow-logs"
         assert group["kmsKeyId"] == "arn:aws:mock:::t-logs"
         key = registered("aws:kms/key:Key", "t-logs")
         assert key["enableKeyRotation"] is True

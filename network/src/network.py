@@ -209,7 +209,7 @@ class Network(pulumi.ComponentResource):
 
     def _flow_logs(self, name: str, args: NetworkArgs, logs: LogEncryption) -> None:
         child_opts = pulumi.ResourceOptions(parent=self)
-        log_group = logs.log_group(f"{name}-flow", "/learning/vpc/flow-logs")
+        log_group = logs.log_group(f"{name}-flow", f"/{name}/vpc/flow-logs")
 
         role = aws.iam.Role(
             f"{name}-flow-logs",

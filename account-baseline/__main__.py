@@ -10,6 +10,14 @@ from src.monitoring import Monitoring, MonitoringArgs
 config = pulumi.Config()
 aws_config = pulumi.Config("aws")
 
+# Every physical name (buckets, trail, log groups, KMS aliases, security
+# groups, the ALB) starts with this, so stacks can share an account. The ALB's
+# 32-character name limit caps the stack name at 10 characters.
+stack = pulumi.get_stack()
+if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,9}", stack):
+    raise ValueError(f'stack name must be 1-10 lowercase letters, digits or hyphens, got "{stack}"')
+prefix = f"learning-{stack}"
+
 # The account this stack is pinned to. The provider refuses to run against
 # any other, and policies use it to scope access to this account only.
 allowed_account_ids = aws_config.require_object("allowedAccountIds")
@@ -23,7 +31,7 @@ if object_lock_mode not in ("GOVERNANCE", "COMPLIANCE"):
     raise ValueError(f'objectLockMode must be GOVERNANCE or COMPLIANCE, got "{object_lock_mode}"')
 
 audit = AuditLogs(
-    "learning-audit",
+    f"{prefix}-audit",
     AuditLogsArgs(
         account_id=account_id,
         region=region,
@@ -33,7 +41,7 @@ audit = AuditLogs(
 )
 
 Detection(
-    "learning-detection",
+    f"{prefix}-detection",
     DetectionArgs(
         account_id=account_id,
         region=region,
@@ -44,7 +52,7 @@ Detection(
 )
 
 monitoring = Monitoring(
-    "learning-alerts",
+    f"{prefix}-alerts",
     MonitoringArgs(
         account_id=account_id,
         key=audit.key,
@@ -53,7 +61,7 @@ monitoring = Monitoring(
     ),
 )
 
-Hardening("learning-hardening", HardeningArgs(imds_hop_limit=config.get_int("imdsHopLimit", default=1)))
+Hardening(f"{prefix}-hardening", HardeningArgs(imds_hop_limit=config.get_int("imdsHopLimit", default=1)))
 
 pulumi.export("auditBucket", audit.bucket.id)
 pulumi.export("auditKeyArn", audit.key.arn)
