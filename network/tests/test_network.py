@@ -13,7 +13,7 @@ from src.load_balancer import SSL_POLICY, LoadBalancer, LoadBalancerArgs
 from src.logging import LogEncryption, LogEncryptionArgs
 from src.nacls import nacl_rules
 from src.network import Network, NetworkArgs
-from src.waf import MANAGED_RULE_GROUPS, Waf, WafArgs
+from src.waf import MANAGED_RULE_GROUPS, UK_AND_EU, Waf, WafArgs
 
 # Everything Network deploys, switched on.
 FULL = Features(
@@ -457,6 +457,7 @@ def waf_args(logs: LogEncryption, **overrides: Any) -> WafArgs:
         rate_window_sec=120,
         managed_rules_mode="count",
         bot_control="common",
+        allowed_countries=UK_AND_EU,
         logs=logs,
     )
     return replace(args, **overrides)
@@ -475,6 +476,7 @@ def waf() -> None:
         Waf("waf-block", waf_args(logs, managed_rules_mode="block"))
         Waf("waf-targeted", waf_args(logs, bot_control="targeted"))
         Waf("waf-nobots", waf_args(logs, bot_control="off"))
+        Waf("waf-anywhere", waf_args(logs, allowed_countries=[]))
 
     run()
 
@@ -523,6 +525,7 @@ class TestWaf:
             for r in sorted(registered("aws:wafv2/webAcl:WebAcl", "waf")["rules"], key=lambda r: r["priority"])
         ]
         assert order == [
+            "geo-allow-list",
             "AWSManagedRulesAmazonIpReputationList",
             "rate-limit-per-ip",
             "AWSManagedRulesCommonRuleSet",
@@ -569,6 +572,22 @@ class TestWaf:
         assert statement["Resource"] == ["arn:aws:mock:::waf-logs:log-stream:*"]
         assert statement["Condition"]["StringEquals"] == {"aws:SourceAccount": "123456789012"}
 
+    def test_blocks_every_country_but_the_uk_and_eu_with_403_before_any_other_rule(self) -> None:
+        acl = registered("aws:wafv2/webAcl:WebAcl", "waf")
+        geo = next(r for r in acl["rules"] if r["name"] == "geo-allow-list")
+        assert geo["priority"] == min(r["priority"] for r in acl["rules"])
+        codes = geo["statement"]["notStatement"]["statement"]["geoMatchStatement"]["countryCodes"]
+        assert codes == sorted(UK_AND_EU)
+        assert len(codes) == 28 and "GB" in codes and "GR" in codes and "EL" not in codes
+        response = geo["action"]["block"]["customResponse"]
+        assert response["responseCode"] == 403
+        assert response["customResponseBodyKey"] in {b["key"] for b in acl["customResponseBodies"]}
+        assert geo["visibilityConfig"]["sampledRequestsEnabled"] is True
+
+    def test_allows_every_country_when_the_allow_list_is_empty(self) -> None:
+        names = [r["name"] for r in registered("aws:wafv2/webAcl:WebAcl", "waf-anywhere")["rules"]]
+        assert "geo-allow-list" not in names
+
     def test_protects_the_load_balancer(self) -> None:
         assoc = registered("aws:wafv2/webAclAssociation:WebAclAssociation", "waf")
         assert assoc == {"resourceArn": "arn:aws:elasticloadbalancing:alb", "webAclArn": "arn:aws:mock:::waf"}
@@ -587,5 +606,7 @@ def test_rejects_rate_windows_limits_and_modes_aws_waf_doesnt_support() -> None:
         Waf("bad-limit", waf_args(logs, rate_limit=5))
     with pytest.raises(ValueError, match="managed_rules_mode must be"):
         Waf("bad-mode", waf_args(logs, managed_rules_mode="on"))
+    with pytest.raises(ValueError, match="ISO 3166-1 alpha-2"):
+        Waf("bad-country", waf_args(logs, allowed_countries=["GB", "uk", "EUR"]))
     with pytest.raises(ValueError, match="bot_control must be one of"):
         Waf("bad-bots", waf_args(logs, bot_control="advanced"))
