@@ -22,6 +22,14 @@ config:
   highly-secure-foundation-network:dataPorts:
     - 5432
 
+  # The internet-facing ALB. domainName must be in the Route 53 public hosted
+  # zone hostedZoneName; the stack adds the ACM validation record and an alias
+  # record for it. Placeholders: replace with your own.
+  highly-secure-foundation-network:domainName: app.example.com
+  highly-secure-foundation-network:hostedZoneName: example.com
+  # Set to true for anything real. Off here so `pulumi destroy` works.
+  highly-secure-foundation-network:albDeletionProtection: false
+
   # Interface endpoints (~$8/month each per AZ). ssm, ssmmessages and
   # ec2messages give Session Manager shell access with no SSH and no bastion.
   highly-secure-foundation-network:interfaceEndpoints:

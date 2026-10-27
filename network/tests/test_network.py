@@ -8,6 +8,7 @@ from conftest import AZS, MOCKS, all_of, registered
 
 from src.address_plan import address_plan
 from src.cidr import subnet_cidr
+from src.load_balancer import SSL_POLICY, LoadBalancer, LoadBalancerArgs
 from src.nacls import nacl_rules
 from src.network import Network, NetworkArgs
 
@@ -97,9 +98,9 @@ def test_only_lets_the_app_tier_reach_the_data_tier_on_the_data_ports() -> None:
     assert all(r.protocol == "tcp" and r.from_port == 5432 and r.to_port == 5432 for r in from_app)
 
 
-def test_only_exposes_https_and_return_traffic_on_the_public_tier() -> None:
+def test_only_exposes_http_https_and_return_traffic_on_the_public_tier() -> None:
     ports = [f"{r.from_port}-{r.to_port}" for r in NACLS["public"].ingress]
-    assert ports == ["443-443", "1024-65535"]
+    assert ports == ["443-443", "80-80", "1024-65535"]
 
 
 def test_rejects_an_app_port_the_public_tiers_rules_wouldnt_carry() -> None:
@@ -187,3 +188,97 @@ class TestNetwork:
             if r.inputs.get("securityGroupId") == "t-sg-data_id"
         ]
         assert data_egress == []
+
+    def test_lets_the_internet_reach_the_alb_on_80_and_443_only(self) -> None:
+        rules = [
+            r.inputs
+            for r in all_of("aws:vpc/securityGroupIngressRule:SecurityGroupIngressRule")
+            if r.inputs.get("securityGroupId") == "t-sg-alb_id"
+        ]
+        assert sorted((r["fromPort"], r["toPort"], r["cidrIpv4"]) for r in rules) == [
+            (80, 80, "0.0.0.0/0"),
+            (443, 443, "0.0.0.0/0"),
+        ]
+
+
+# ── LoadBalancer
+
+LB_ARGS = LoadBalancerArgs(
+    account_id="123456789012",
+    region="eu-west-1",
+    vpc_id="vpc-1",
+    subnet_ids=["subnet-a", "subnet-b", "subnet-c"],
+    security_group_id="sg-alb",
+    app_port=8443,
+    domain_name="app.example.com",
+    hosted_zone_name="example.com",
+    deletion_protection=False,
+    log_retention_days=365,
+)
+
+
+@pytest.fixture(scope="module")
+def load_balancer() -> None:
+    @pulumi.runtime.test
+    def run() -> None:
+        LoadBalancer("lb", LB_ARGS)
+
+    run()
+
+
+@pytest.mark.usefixtures("load_balancer")
+class TestLoadBalancer:
+    def test_is_internet_facing_in_the_public_subnets_and_drops_invalid_headers(self) -> None:
+        alb = registered("aws:lb/loadBalancer:LoadBalancer", "lb")
+        assert alb["loadBalancerType"] == "application"
+        assert alb["internal"] is False
+        assert alb["subnets"] == ["subnet-a", "subnet-b", "subnet-c"]
+        assert alb["securityGroups"] == ["sg-alb"]
+        assert alb["dropInvalidHeaderFields"] is True
+        assert alb["desyncMitigationMode"] == "strictest"
+        assert alb["accessLogs"] == {"bucket": "lb-logs_id", "prefix": "alb", "enabled": True}
+
+    def test_redirects_http_to_https_permanently(self) -> None:
+        http = registered("aws:lb/listener:Listener", "lb-http")
+        assert http["port"] == 80
+        assert http["protocol"] == "HTTP"
+        assert http["defaultActions"] == [
+            {"type": "redirect", "redirect": {"protocol": "HTTPS", "port": "443", "statusCode": "HTTP_301"}}
+        ]
+
+    def test_terminates_tls_1_2_and_1_3_with_the_validated_certificate(self) -> None:
+        https = registered("aws:lb/listener:Listener", "lb-https")
+        assert https["port"] == 443
+        assert https["protocol"] == "HTTPS"
+        assert https["sslPolicy"] == SSL_POLICY
+        assert https["certificateArn"] == "arn:aws:mock:::lb"
+        assert https["defaultActions"][0]["type"] == "fixed-response"
+        assert https["routingHttpResponseStrictTransportSecurityHeaderValue"].startswith("max-age=31536000")
+        assert https["routingHttpResponseServerEnabled"] is False
+
+    def test_validates_the_certificate_through_dns_and_points_the_domain_at_the_alb(self) -> None:
+        cert = registered("aws:acm/certificate:Certificate", "lb")
+        assert cert == {"domainName": "app.example.com", "validationMethod": "DNS"}
+        record = registered("aws:route53/record:Record", "lb-cert-validation")
+        assert record["zoneId"] == "Z-ZONE"
+        assert record["type"] == "CNAME"
+        alias = registered("aws:route53/record:Record", "lb-alias")
+        assert alias["name"] == "app.example.com"
+        assert alias["aliases"] == [{"name": "lb.elb.example", "zoneId": "Z-ALB", "evaluateTargetHealth": True}]
+
+    def test_has_an_https_target_group_on_the_app_port_ready_for_workloads(self) -> None:
+        tg = registered("aws:lb/targetGroup:TargetGroup", "lb")
+        assert (tg["port"], tg["protocol"], tg["targetType"]) == (8443, "HTTPS", "ip")
+        assert tg["healthCheck"]["protocol"] == "HTTPS"
+
+    def test_lets_only_the_elb_account_write_access_logs_over_tls(self) -> None:
+        policy = registered("aws:s3/bucketPolicy:BucketPolicy", "lb-logs")
+        statements = {s["Sid"]: s for s in json.loads(policy["policy"])["Statement"]}
+        delivery = statements["ElbLogDelivery"]
+        assert delivery["Principal"] == {"AWS": ["arn:aws:iam::156460612806:root"]}
+        assert delivery["Resource"] == ["arn:aws:mock:::lb-logs/alb/AWSLogs/123456789012/*"]
+        assert statements["DenyInsecureTransport"]["Effect"] == "Deny"
+        sse = registered(
+            "aws:s3/bucketServerSideEncryptionConfiguration:BucketServerSideEncryptionConfiguration", "lb-logs"
+        )
+        assert sse["rules"][0]["applyServerSideEncryptionByDefault"]["sseAlgorithm"] == "AES256"

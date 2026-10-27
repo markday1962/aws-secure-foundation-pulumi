@@ -66,11 +66,12 @@ def nacl_rules(plan: AddressPlan, app_port: int, data_ports: list[int]) -> dict[
         ]
 
     result: dict[Tier, TierNacl] = {
-        # Load balancers (HTTPS in) and NAT gateways (HTTPS out on behalf of the app tier).
+        # Load balancers (HTTP and HTTPS in) and NAT gateways (HTTPS out on behalf of the app tier).
         "public": TierNacl(
             ingress=rules(
                 [
                     tcp(ANYWHERE, https),  # clients → load balancer; app tier → NAT
+                    tcp(ANYWHERE, port(80)),  # clients → load balancer, redirected to HTTPS
                     tcp(ANYWHERE, EPHEMERAL),  # responses: internet → NAT, targets → load balancer
                 ]
             ),
