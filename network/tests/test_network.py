@@ -298,6 +298,7 @@ def waf_args(logs: LogEncryption, **overrides: Any) -> WafArgs:
         rate_limit=500,
         rate_window_sec=120,
         managed_rules_mode="count",
+        bot_control="common",
         logs=logs,
     )
     return replace(args, **overrides)
@@ -314,6 +315,8 @@ def waf() -> None:
         logs = waf_logs("waf-net-logs")
         Waf("waf", waf_args(logs))
         Waf("waf-block", waf_args(logs, managed_rules_mode="block"))
+        Waf("waf-targeted", waf_args(logs, bot_control="targeted"))
+        Waf("waf-nobots", waf_args(logs, bot_control="off"))
 
     run()
 
@@ -353,7 +356,7 @@ class TestWaf:
     def test_lets_the_managed_rule_groups_block_in_block_mode(self) -> None:
         rules = registered("aws:wafv2/webAcl:WebAcl", "waf-block")["rules"]
         managed = [r for r in rules if "managedRuleGroupStatement" in r["statement"]]
-        assert len(managed) == len(MANAGED_RULE_GROUPS)
+        assert len(managed) == len(MANAGED_RULE_GROUPS) + 1  # plus Bot Control
         assert all(r["overrideAction"] == {"none": {}} for r in managed)
 
     def test_checks_ip_reputation_before_the_rate_limit_and_the_rest_after(self) -> None:
@@ -366,7 +369,26 @@ class TestWaf:
             "rate-limit-per-ip",
             "AWSManagedRulesCommonRuleSet",
             "AWSManagedRulesKnownBadInputsRuleSet",
+            "AWSManagedRulesBotControlRuleSet",
         ]
+
+    def test_runs_bot_control_last_at_the_chosen_inspection_level(self) -> None:
+        def bot_rule(acl: str) -> dict[str, Any] | None:
+            rules = registered("aws:wafv2/webAcl:WebAcl", acl)["rules"]
+            return next((r for r in rules if r["name"] == "AWSManagedRulesBotControlRuleSet"), None)
+
+        common = bot_rule("waf")
+        assert common is not None
+        assert common["overrideAction"] == {"count": {}}
+        assert common["statement"]["managedRuleGroupStatement"]["managedRuleGroupConfigs"] == [
+            {"awsManagedRulesBotControlRuleSet": {"inspectionLevel": "COMMON"}}
+        ]
+        targeted = bot_rule("waf-targeted")
+        assert targeted is not None
+        assert targeted["statement"]["managedRuleGroupStatement"]["managedRuleGroupConfigs"] == [
+            {"awsManagedRulesBotControlRuleSet": {"inspectionLevel": "TARGETED", "enableMachineLearning": True}}
+        ]
+        assert bot_rule("waf-nobots") is None
 
     def test_logs_every_request_to_an_encrypted_waf_log_group_without_credentials(self) -> None:
         group = registered("aws:cloudwatch/logGroup:LogGroup", "waf-logs")
@@ -402,3 +424,5 @@ def test_rejects_rate_windows_limits_and_modes_aws_waf_doesnt_support() -> None:
         Waf("bad-limit", waf_args(logs, rate_limit=5))
     with pytest.raises(ValueError, match="managed_rules_mode must be"):
         Waf("bad-mode", waf_args(logs, managed_rules_mode="on"))
+    with pytest.raises(ValueError, match="bot_control must be one of"):
+        Waf("bad-bots", waf_args(logs, bot_control="advanced"))

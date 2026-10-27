@@ -33,7 +33,7 @@ switch off your CloudTrail or GuardDuty.
 ```
                      Internet
                         │  AWS WAF: IP reputation · rate limit → 429 ·
-                        │           common rule set · known bad inputs
+                        │           common rule set · known bad inputs · Bot Control
                         │  :80 → 301 to :443
                         │  :443 TLS 1.2/1.3 (ACM certificate, app.example.com)
                 ┌───────▼────────┐
@@ -57,7 +57,7 @@ switch off your CloudTrail or GuardDuty.
 **Inbound:** client → IGW → AWS WAF → ALB. WAF blocks any client IP that
 makes more than `wafRateLimit` requests per `wafRateWindowSec` (default 1000
 per 5 minutes) with `429 Too Many Requests` and a `Retry-After` header, until
-its rate drops back under the limit. Three AWS managed rule groups run
+its rate drops back under the limit. Four AWS managed rule groups run
 around it:
 
 | Priority | Rule | What it matches |
@@ -66,6 +66,7 @@ around it:
 | 20 | `rate-limit-per-ip` | any IP over the rate limit (always blocks) |
 | 30 | `AWSManagedRulesCommonRuleSet` | the OWASP Top 10 baseline: XSS, path traversal, oversized requests, bad bots |
 | 40 | `AWSManagedRulesKnownBadInputsRuleSet` | known exploit patterns such as Log4j and Java deserialisation |
+| 50 | `AWSManagedRulesBotControlRuleSet` (paid, optional) | bots and automation: scrapers, scanners, HTTP libraries, headless browsers. Runs last, so requests already blocked aren't charged for its inspection |
 
 The managed groups start in **count mode** (`wafManagedRulesMode: count`):
 they record what they *would* block, in CloudWatch metrics
@@ -73,6 +74,18 @@ they record what they *would* block, in CloudWatch metrics
 let it through. Watch them under real traffic, add exclusions for any false
 positives (the common rule set's `SizeRestrictions_BODY`, which matches bodies
 over 8 KB, is the usual one), then set `wafManagedRulesMode: block`.
+
+**Bot Control** is set by `wafBotControl`:
+- `common` (the default) matches bots that identify themselves or show
+  automation signals. It costs $10/month plus $1 per million requests.
+- `targeted` also fingerprints browsers, challenges suspicious clients and
+  uses machine learning. It costs $10 per million requests.
+- `off` leaves the group out.
+
+Bot Control follows `wafManagedRulesMode`. Before switching to `block`, check
+which of your own clients it counts. Health checkers, uptime monitors, CI
+jobs and `curl` all count as automation. Its `CategoryHttpLibrary` and
+`SignalNonBrowserUserAgent` rules would block the `curl` checks below.
 
 **WAF logs:** every request the web ACL sees is logged in full to the
 CloudWatch log group `aws-waf-logs-learning-<stack>-waf`, encrypted with the
@@ -106,7 +119,7 @@ group and NACL limit it to port 443, and nothing more.
 | **SEC05-BP01** Create network layers | Three tiers: public, app, and isolated data. The data tier has no route outside the VPC. |
 | **SEC05-BP02** Control traffic in every layer | Route tables; network ACLs per tier; security groups that reference each other (internet → ALB → app → data); both ingress and egress controlled. |
 | **SEC05-BP02** Private access to services | S3 and DynamoDB gateway endpoints, plus 10 interface endpoints, with policies that admit only this account's principals (a data perimeter). |
-| **SEC05-BP03** Inspection-based protection | AWS WAF web ACL on the ALB: AWS IP reputation, common rule set and known bad inputs (count mode first), per-IP rate limiting, with CloudWatch metrics and sampled requests per rule. |
+| **SEC05-BP03** Inspection-based protection | AWS WAF web ACL on the ALB: AWS IP reputation, common rule set, known bad inputs and Bot Control (count mode first), per-IP rate limiting, with CloudWatch metrics and sampled requests per rule. |
 | **SEC05-BP04** Automate network protection | All of it is code, with unit tests that check the rules. |
 | **SEC09** Protect data in transit | HTTP→HTTPS redirect, TLS 1.2/1.3 only, HSTS, TLS to the targets; buckets deny non-TLS requests. |
 | Lock down defaults (CIS 5.4) | Default security group and default network ACL both stripped of every rule. |
@@ -149,7 +162,7 @@ format and lint, pyright and pytest. It never touches AWS.
 
 ```sh
 make install                              # a .venv in each project
-make test                                 # 46 unit tests across both projects, no AWS needed
+make test                                 # 47 unit tests across both projects, no AWS needed
 make lint                                 # ruff and pyright
 
 pulumi login --local                      # local state while learning
@@ -172,12 +185,13 @@ for i in $(seq 1 1200); do curl -s -o /dev/null -w "%{http_code}\n" https://app.
 | Interface endpoints, 10 × 3 AZs | ~$240 + $0.01/GB |
 | NAT gateways, 1 per AZ × 3 | ~$105 + $0.048/GB |
 | Application Load Balancer | ~$18 + LCUs |
-| AWS WAF, 1 web ACL + 4 rules | ~$9 + $0.60 per million requests |
+| AWS WAF, 1 web ACL + 5 rules | ~$10 + $0.60 per million requests |
+| WAF Bot Control (`common`) | ~$10 + $1 per million requests |
 | WAF logs in CloudWatch | ~$0.57/GB ingested (roughly 1–2 GB per million requests) |
 | Public IPv4 addresses (NAT EIPs, ALB) | ~$20 |
 | GuardDuty, Security Hub, Config | usage-based; usually tens of dollars in a quiet account |
 | KMS keys (2), logs, alarms (14), Route 53 zone | a few dollars |
-| **Total** | **~$400+** |
+| **Total** | **~$410+** |
 
 To cut costs, set `natGateways: single` (saves ~$70, but an outage in that AZ
 cuts every AZ's internet access) or trim `interfaceEndpoints` in
@@ -202,8 +216,8 @@ cuts every AZ's internet access) or trim `interfaceEndpoints` in
 
 ## What's deliberately not here
 
-- **More WAF**: geo rules, and the paid managed groups (Bot Control, Account
-  Takeover Prevention), are still to come. A logging filter (keep only
+- **More WAF**: geo rules, and the other paid managed groups (Account
+  Takeover Prevention, Account Creation Fraud Prevention), are still to come. A logging filter (keep only
   blocked and counted requests) would cut log costs on a busy site.
 - **Egress filtering by destination**: Network Firewall and DNS Firewall were
   removed. To bring domain filtering back cheaply, re-add a Route 53 DNS
