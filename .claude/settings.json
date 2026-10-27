@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "ask": [
+      "Bash(pulumi up*)",
+      "Bash(pulumi * up*)",
+      "Bash(pulumi destroy*)",
+      "Bash(pulumi * destroy*)",
+      "Bash(pulumi refresh*)",
+      "Bash(pulumi * refresh*)",
+      "Bash(pulumi import*)",
+      "Bash(pulumi * import*)",
+      "Bash(pulumi cancel*)",
+      "Bash(pulumi * cancel*)",
+      "Bash(pulumi state*)",
+      "Bash(pulumi * state*)",
+      "Bash(pulumi stack rm*)",
+      "Bash(pulumi * stack rm*)",
+      "Bash(pulumi stack import*)",
+      "Bash(pulumi * stack import*)"
+    ],
+    "allow": [
+      "Bash(make install)",
+      "Bash(make test)",
+      "Bash(make lint)",
+      "Bash(uv sync*)",
+      "Bash(uv run pytest*)",
+      "Bash(uv run ruff*)",
+      "Bash(uv run pyright*)",
+      "Bash(actionlint*)",
+      "Bash(zizmor*)",
+      "Bash(pulumi preview*)",
+      "Bash(pulumi version)",
+      "Bash(pulumi stack ls*)",
+      "Bash(pulumi stack output*)",
+      "Bash(gh pr checks*)",
+      "Bash(gh pr view*)",
+      "Bash(gh pr list*)",
+      "Bash(gh run list*)",
+      "Bash(gh run view*)",
+      "Bash(gh run watch*)"
+    ]
+  }
+}
