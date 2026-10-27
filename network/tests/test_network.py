@@ -9,8 +9,10 @@ from conftest import AZS, MOCKS, all_of, registered
 from src.address_plan import address_plan
 from src.cidr import subnet_cidr
 from src.load_balancer import SSL_POLICY, LoadBalancer, LoadBalancerArgs
+from src.logging import LogEncryption, LogEncryptionArgs
 from src.nacls import nacl_rules
 from src.network import Network, NetworkArgs
+from src.waf import MANAGED_RULE_GROUPS, Waf, WafArgs
 
 ARGS = NetworkArgs(
     account_id="123456789012",
@@ -283,3 +285,120 @@ class TestLoadBalancer:
             "aws:s3/bucketServerSideEncryptionConfiguration:BucketServerSideEncryptionConfiguration", "lb-logs"
         )
         assert sse["rules"][0]["applyServerSideEncryptionByDefault"]["sseAlgorithm"] == "AES256"
+
+
+# ── Waf
+
+
+def waf_args(logs: LogEncryption, **overrides: Any) -> WafArgs:
+    args = WafArgs(
+        account_id="123456789012",
+        region="eu-west-1",
+        alb_arn="arn:aws:elasticloadbalancing:alb",
+        rate_limit=500,
+        rate_window_sec=120,
+        managed_rules_mode="count",
+        logs=logs,
+    )
+    return replace(args, **overrides)
+
+
+def waf_logs(name: str) -> LogEncryption:
+    return LogEncryption(name, LogEncryptionArgs(account_id="123456789012", region="eu-west-1", retention_days=365))
+
+
+@pytest.fixture(scope="module")
+def waf() -> None:
+    @pulumi.runtime.test
+    def run() -> None:
+        logs = waf_logs("waf-net-logs")
+        Waf("waf", waf_args(logs))
+        Waf("waf-block", waf_args(logs, managed_rules_mode="block"))
+
+    run()
+
+
+@pytest.mark.usefixtures("waf")
+class TestWaf:
+    def test_is_a_regional_web_acl_that_allows_by_default(self) -> None:
+        acl = registered("aws:wafv2/webAcl:WebAcl", "waf")
+        assert acl["scope"] == "REGIONAL"
+        assert acl["defaultAction"] == {"allow": {}}
+        assert acl["visibilityConfig"]["cloudwatchMetricsEnabled"] is True
+
+    def test_blocks_ips_over_the_rate_limit_with_429_and_retry_after(self) -> None:
+        acl = registered("aws:wafv2/webAcl:WebAcl", "waf")
+        (rule,) = [r for r in acl["rules"] if r["name"] == "rate-limit-per-ip"]
+        assert rule["statement"]["rateBasedStatement"] == {
+            "aggregateKeyType": "IP",
+            "limit": 500,
+            "evaluationWindowSec": 120,
+        }
+        response = rule["action"]["block"]["customResponse"]
+        assert response["responseCode"] == 429
+        assert response["responseHeaders"] == [{"name": "Retry-After", "value": "120"}]
+        bodies = {b["key"] for b in acl["customResponseBodies"]}
+        assert response["customResponseBodyKey"] in bodies
+        assert rule["visibilityConfig"]["sampledRequestsEnabled"] is True
+
+    def test_runs_the_aws_managed_rule_groups_in_count_mode(self) -> None:
+        rules = {r["name"]: r for r in registered("aws:wafv2/webAcl:WebAcl", "waf")["rules"]}
+        for group in MANAGED_RULE_GROUPS:
+            rule = rules[group.name]
+            assert rule["statement"]["managedRuleGroupStatement"] == {"vendorName": "AWS", "name": group.name}
+            assert rule["overrideAction"] == {"count": {}}
+            assert "action" not in rule
+            assert rule["visibilityConfig"]["sampledRequestsEnabled"] is True
+
+    def test_lets_the_managed_rule_groups_block_in_block_mode(self) -> None:
+        rules = registered("aws:wafv2/webAcl:WebAcl", "waf-block")["rules"]
+        managed = [r for r in rules if "managedRuleGroupStatement" in r["statement"]]
+        assert len(managed) == len(MANAGED_RULE_GROUPS)
+        assert all(r["overrideAction"] == {"none": {}} for r in managed)
+
+    def test_checks_ip_reputation_before_the_rate_limit_and_the_rest_after(self) -> None:
+        order = [
+            r["name"]
+            for r in sorted(registered("aws:wafv2/webAcl:WebAcl", "waf")["rules"], key=lambda r: r["priority"])
+        ]
+        assert order == [
+            "AWSManagedRulesAmazonIpReputationList",
+            "rate-limit-per-ip",
+            "AWSManagedRulesCommonRuleSet",
+            "AWSManagedRulesKnownBadInputsRuleSet",
+        ]
+
+    def test_logs_every_request_to_an_encrypted_waf_log_group_without_credentials(self) -> None:
+        group = registered("aws:cloudwatch/logGroup:LogGroup", "waf-logs")
+        assert group["name"] == "aws-waf-logs-waf"
+        assert group["kmsKeyId"] == "arn:aws:mock:::waf-net-logs"
+        assert group["retentionInDays"] == 365
+        logging = registered("aws:wafv2/webAclLoggingConfiguration:WebAclLoggingConfiguration", "waf")
+        assert logging["resourceArn"] == "arn:aws:mock:::waf"
+        assert logging["logDestinationConfigs"] == ["arn:aws:mock:::waf-logs"]
+        assert "loggingFilter" not in logging
+        assert logging["redactedFields"] == [
+            {"singleHeader": {"name": "authorization"}},
+            {"singleHeader": {"name": "cookie"}},
+        ]
+
+    def test_lets_only_this_accounts_log_delivery_write_waf_logs(self) -> None:
+        policy = registered("aws:cloudwatch/logResourcePolicy:LogResourcePolicy", "waf-logs")
+        (statement,) = json.loads(policy["policyDocument"])["Statement"]
+        assert statement["Principal"] == {"Service": ["delivery.logs.amazonaws.com"]}
+        assert statement["Resource"] == ["arn:aws:mock:::waf-logs:log-stream:*"]
+        assert statement["Condition"]["StringEquals"] == {"aws:SourceAccount": "123456789012"}
+
+    def test_protects_the_load_balancer(self) -> None:
+        assoc = registered("aws:wafv2/webAclAssociation:WebAclAssociation", "waf")
+        assert assoc == {"resourceArn": "arn:aws:elasticloadbalancing:alb", "webAclArn": "arn:aws:mock:::waf"}
+
+
+def test_rejects_rate_windows_limits_and_modes_aws_waf_doesnt_support() -> None:
+    logs = waf_logs("reject-logs")
+    with pytest.raises(ValueError, match="rate_window_sec must be one of"):
+        Waf("bad-window", waf_args(logs, rate_window_sec=90))
+    with pytest.raises(ValueError, match="rate_limit must be between"):
+        Waf("bad-limit", waf_args(logs, rate_limit=5))
+    with pytest.raises(ValueError, match="managed_rules_mode must be"):
+        Waf("bad-mode", waf_args(logs, managed_rules_mode="on"))

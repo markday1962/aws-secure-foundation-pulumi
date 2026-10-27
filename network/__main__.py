@@ -4,6 +4,7 @@ import pulumi
 
 from src.load_balancer import LoadBalancer, LoadBalancerArgs
 from src.network import Network, NetworkArgs
+from src.waf import Waf, WafArgs
 
 config = pulumi.Config()
 aws_config = pulumi.Config("aws")
@@ -77,7 +78,25 @@ pulumi.export(
 )
 pulumi.export("natGatewayIds", [n.id for n in network.nat_gateways])
 pulumi.export("logKeyArn", network.log_key.arn)
+waf_managed_rules_mode = config.get("wafManagedRulesMode", default="count")
+if waf_managed_rules_mode not in ("count", "block"):
+    raise ValueError(f'wafManagedRulesMode must be "count" or "block", got "{waf_managed_rules_mode}"')
+
+waf = Waf(
+    f"{prefix}-waf",
+    WafArgs(
+        account_id=account_id,
+        region=region,
+        alb_arn=alb.alb.arn,
+        rate_limit=config.get_int("wafRateLimit", default=1000),
+        rate_window_sec=config.get_int("wafRateWindowSec", default=300),
+        managed_rules_mode=waf_managed_rules_mode,
+        logs=network.logs,
+    ),
+)
+
 pulumi.export("albArn", alb.alb.arn)
+pulumi.export("webAclArn", waf.web_acl.arn)
 pulumi.export("albDnsName", alb.alb.dns_name)
 pulumi.export("httpsListenerArn", alb.https_listener.arn)
 pulumi.export("targetGroupArn", alb.target_group.arn)

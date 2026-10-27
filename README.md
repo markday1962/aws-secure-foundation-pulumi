@@ -9,13 +9,14 @@ Derived from
 [aws-highly-secure-foundation-pulumi](https://github.com/markday1962/aws-highly-secure-foundation-pulumi),
 with these changes: Network Firewall and DNS Firewall are removed; an ALB is
 added (HTTP redirects to HTTPS); and the account baseline closes the Security
-Hub gaps the original left open, adding alerting. **AWS WAF** rules on the ALB
-are the next phase.
+Hub gaps the original left open, adding alerting. **AWS WAF** sits in front of
+the ALB, with per-IP rate limiting and the AWS managed rule groups (in count
+mode to begin with).
 
 ```
 aws-secure-foundation-pulumi/
 ├── account-baseline/   once per account: CloudTrail, GuardDuty, Security Hub, Config, alerts, account hardening
-├── network/            the three-tier VPC, the ALB, endpoints and logging
+├── network/            the three-tier VPC, the ALB and its WAF, endpoints and logging
 └── Makefile            install, test and lint both projects
 ```
 
@@ -31,6 +32,8 @@ switch off your CloudTrail or GuardDuty.
 
 ```
                      Internet
+                        │  AWS WAF: IP reputation · rate limit → 429 ·
+                        │           common rule set · known bad inputs
                         │  :80 → 301 to :443
                         │  :443 TLS 1.2/1.3 (ACM certificate, app.example.com)
                 ┌───────▼────────┐
@@ -47,11 +50,45 @@ switch off your CloudTrail or GuardDuty.
  │ 10.0.100.0/22…                                                             │
  │                                                                            │
  │ default SG + default NACL deny all                                         │
- │ VPC flow logs → CloudWatch (KMS, 365 days) · ALB access logs → S3          │
+ │ flow logs + WAF logs → CloudWatch (KMS, 365 days) · ALB access logs → S3   │
  └────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Inbound:** client → IGW → ALB. Port 80 only ever answers with a 301 to
+**Inbound:** client → IGW → AWS WAF → ALB. WAF blocks any client IP that
+makes more than `wafRateLimit` requests per `wafRateWindowSec` (default 1000
+per 5 minutes) with `429 Too Many Requests` and a `Retry-After` header, until
+its rate drops back under the limit. Three AWS managed rule groups run
+around it:
+
+| Priority | Rule | What it matches |
+|---|---|---|
+| 10 | `AWSManagedRulesAmazonIpReputationList` | IPs Amazon threat intelligence has seen attacking (checked first, so they don't use up the rate limit) |
+| 20 | `rate-limit-per-ip` | any IP over the rate limit (always blocks) |
+| 30 | `AWSManagedRulesCommonRuleSet` | the OWASP Top 10 baseline: XSS, path traversal, oversized requests, bad bots |
+| 40 | `AWSManagedRulesKnownBadInputsRuleSet` | known exploit patterns such as Log4j and Java deserialisation |
+
+The managed groups start in **count mode** (`wafManagedRulesMode: count`):
+they record what they *would* block, in CloudWatch metrics
+(`AWS/WAFV2`, one metric per rule) and in the web ACL's sampled requests, but
+let it through. Watch them under real traffic, add exclusions for any false
+positives (the common rule set's `SizeRestrictions_BODY`, which matches bodies
+over 8 KB, is the usual one), then set `wafManagedRulesMode: block`.
+
+**WAF logs:** every request the web ACL sees is logged in full to the
+CloudWatch log group `aws-waf-logs-learning-<stack>-waf`, encrypted with the
+network's KMS key and kept for `logRetentionDays`. The `authorization` and
+`cookie` headers are redacted. To see what the count-mode groups would have
+blocked, run this in CloudWatch Logs Insights:
+
+```
+fields @timestamp, httpRequest.clientIp, httpRequest.httpMethod, httpRequest.uri
+| filter @message like /"action":"COUNT"/
+| sort @timestamp desc
+```
+
+Each matching record's `ruleGroupList` names the group and rule that matched.
+
+Port 80 only ever answers with a 301 to
 HTTPS. Port 443 terminates TLS with `ELBSecurityPolicy-TLS13-1-2-Res-2021-06`,
 adds HSTS, `nosniff` and `X-Frame-Options: DENY`, drops malformed headers, and
 for now returns a fixed `200 ok`. An empty HTTPS target group on `appPort` is
@@ -69,11 +106,11 @@ group and NACL limit it to port 443, and nothing more.
 | **SEC05-BP01** Create network layers | Three tiers: public, app, and isolated data. The data tier has no route outside the VPC. |
 | **SEC05-BP02** Control traffic in every layer | Route tables; network ACLs per tier; security groups that reference each other (internet → ALB → app → data); both ingress and egress controlled. |
 | **SEC05-BP02** Private access to services | S3 and DynamoDB gateway endpoints, plus 10 interface endpoints, with policies that admit only this account's principals (a data perimeter). |
-| **SEC05-BP03** Inspection-based protection | *Next phase:* AWS WAF web ACL on the ALB (the stack exports `albArn`). |
+| **SEC05-BP03** Inspection-based protection | AWS WAF web ACL on the ALB: AWS IP reputation, common rule set and known bad inputs (count mode first), per-IP rate limiting, with CloudWatch metrics and sampled requests per rule. |
 | **SEC05-BP04** Automate network protection | All of it is code, with unit tests that check the rules. |
 | **SEC09** Protect data in transit | HTTP→HTTPS redirect, TLS 1.2/1.3 only, HSTS, TLS to the targets; buckets deny non-TLS requests. |
 | Lock down defaults (CIS 5.4) | Default security group and default network ACL both stripped of every rule. |
-| **SEC04-BP01/02** Logging in standard places | VPC flow logs (all traffic, 1-minute, v5 fields), ALB access logs, CloudTrail (S3 and CloudWatch Logs), S3 server access logs on the audit bucket, AWS Config. |
+| **SEC04-BP01/02** Logging in standard places | VPC flow logs (all traffic, 1-minute, v5 fields), ALB access logs, WAF logs (every request, credentials redacted), CloudTrail (S3 and CloudWatch Logs), S3 server access logs on the audit bucket, AWS Config. |
 | **SEC04** Detect unexpected behaviour | GuardDuty (with S3, EKS, EBS malware, RDS, Lambda and runtime monitoring), Security Hub (FSBP + CIS 5.0.0), IAM Access Analyzer, the 14 CIS CloudTrail metric-filter alarms. |
 | **SEC04-BP03 / SEC10** Alert and respond | High-severity GuardDuty findings, new HIGH/CRITICAL Security Hub findings and the CIS alarms go to an encrypted SNS topic (optional email). |
 | Protect data at rest | Customer-managed KMS keys with rotation for logs and alerts; EBS encryption by default; audit logs in an Object Lock bucket. |
@@ -108,7 +145,7 @@ Needs Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
 ```sh
 make install                              # a .venv in each project
-make test                                 # 37 unit tests across both projects, no AWS needed
+make test                                 # 46 unit tests across both projects, no AWS needed
 make lint                                 # ruff and pyright
 
 pulumi login --local                      # local state while learning
@@ -119,6 +156,9 @@ cd ../network       && pulumi stack init dev && pulumi up
 
 curl -I http://app.example.com            # 301, Location: https://app.example.com:443/
 curl https://app.example.com              # ok
+
+# Rate limit: go past wafRateLimit; WAF takes up to a minute or so to start blocking.
+for i in $(seq 1 1200); do curl -s -o /dev/null -w "%{http_code}\n" https://app.example.com; done | sort | uniq -c
 ```
 
 ## Cost (eu-west-1, approximate)
@@ -128,10 +168,12 @@ curl https://app.example.com              # ok
 | Interface endpoints, 10 × 3 AZs | ~$240 + $0.01/GB |
 | NAT gateways, 1 per AZ × 3 | ~$105 + $0.048/GB |
 | Application Load Balancer | ~$18 + LCUs |
+| AWS WAF, 1 web ACL + 4 rules | ~$9 + $0.60 per million requests |
+| WAF logs in CloudWatch | ~$0.57/GB ingested (roughly 1–2 GB per million requests) |
 | Public IPv4 addresses (NAT EIPs, ALB) | ~$20 |
 | GuardDuty, Security Hub, Config | usage-based; usually tens of dollars in a quiet account |
 | KMS keys (2), logs, alarms (14), Route 53 zone | a few dollars |
-| **Total** | **~$390+** |
+| **Total** | **~$400+** |
 
 To cut costs, set `natGateways: single` (saves ~$70, but an outage in that AZ
 cuts every AZ's internet access) or trim `interfaceEndpoints` in
@@ -156,8 +198,9 @@ cuts every AZ's internet access) or trim `interfaceEndpoints` in
 
 ## What's deliberately not here
 
-- **AWS WAF**: the next phase. Attach a web ACL with AWS managed rules to the
-  exported `albArn`.
+- **More WAF**: geo rules, and the paid managed groups (Bot Control, Account
+  Takeover Prevention), are still to come. A logging filter (keep only
+  blocked and counted requests) would cut log costs on a busy site.
 - **Egress filtering by destination**: Network Firewall and DNS Firewall were
   removed. To bring domain filtering back cheaply, re-add a Route 53 DNS
   Firewall allow-list.
