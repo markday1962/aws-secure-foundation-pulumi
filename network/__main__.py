@@ -82,6 +82,10 @@ waf_managed_rules_mode = config.get("wafManagedRulesMode", default="count")
 if waf_managed_rules_mode not in ("count", "block"):
     raise ValueError(f'wafManagedRulesMode must be "count" or "block", got "{waf_managed_rules_mode}"')
 
+waf_bot_control = config.get("wafBotControl", default="common")
+if waf_bot_control not in ("off", "common", "targeted"):
+    raise ValueError(f'wafBotControl must be "off", "common" or "targeted", got "{waf_bot_control}"')
+
 waf = Waf(
     f"{prefix}-waf",
     WafArgs(
@@ -91,6 +95,7 @@ waf = Waf(
         rate_limit=config.get_int("wafRateLimit", default=1000),
         rate_window_sec=config.get_int("wafRateWindowSec", default=300),
         managed_rules_mode=waf_managed_rules_mode,
+        bot_control=waf_bot_control,
         logs=network.logs,
     ),
 )

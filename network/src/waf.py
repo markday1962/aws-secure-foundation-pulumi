@@ -14,6 +14,19 @@ RATE_WINDOWS = (60, 120, 300, 600)
 # requests) without blocking it; "block" lets each group's rules act.
 ManagedRulesMode = Literal["count", "block"]
 
+# Bot Control's inspection level. "common" spots self-identifying bots and
+# automation from request signals ($1 per million requests); "targeted" also
+# fingerprints browsers, challenges clients and uses machine learning to catch
+# sophisticated bots ($10 per million). Both add a $10/month subscription.
+BotControlLevel = Literal["off", "common", "targeted"]
+BOT_CONTROL_LEVELS = ("off", "common", "targeted")
+
+# The provider's (long) names for a managed rule group's settings.
+GroupConfig = aws.wafv2.WebAclRuleStatementManagedRuleGroupStatementManagedRuleGroupConfigArgsDict
+BotControlSettings = (
+    aws.wafv2.WebAclRuleStatementManagedRuleGroupStatementManagedRuleGroupConfigAwsManagedRulesBotControlRuleSetArgsDict
+)  # noqa: E501
+
 
 @dataclass(frozen=True)
 class ManagedRuleGroup:
@@ -21,6 +34,8 @@ class ManagedRuleGroup:
     name: str
     # Where it runs relative to the other rules (lower runs first).
     priority: int
+    # Settings the group needs, if any (e.g. Bot Control's inspection level).
+    configs: list[GroupConfig] | None = None
 
 
 # AWS managed rule groups, free with WAF. Together about 925 of the web ACL's
@@ -34,6 +49,31 @@ MANAGED_RULE_GROUPS = [
     # Request patterns tied to known exploits, such as Log4j and Java deserialisation.
     ManagedRuleGroup("AWSManagedRulesKnownBadInputsRuleSet", priority=40),
 ]
+
+
+def bot_control(level: BotControlLevel) -> ManagedRuleGroup:
+    """
+    The paid Bot Control group. It runs last, so requests the free rules (and
+    the rate limit) already block aren't charged for its inspection.
+    """
+    settings: BotControlSettings = {"inspection_level": level.upper()}
+    if level == "targeted":
+        settings["enable_machine_learning"] = True
+    return ManagedRuleGroup(
+        "AWSManagedRulesBotControlRuleSet",
+        priority=50,
+        configs=[{"aws_managed_rules_bot_control_rule_set": settings}],
+    )
+
+
+def managed_statement(group: ManagedRuleGroup) -> aws.wafv2.WebAclRuleStatementManagedRuleGroupStatementArgsDict:
+    statement: aws.wafv2.WebAclRuleStatementManagedRuleGroupStatementArgsDict = {
+        "vendor_name": "AWS",
+        "name": group.name,
+    }
+    if group.configs:
+        statement["managed_rule_group_configs"] = group.configs
+    return statement
 
 
 # Headers never written to the WAF logs: they carry credentials and session tokens.
@@ -53,6 +93,8 @@ class WafArgs:
     # Whether the managed rule groups only count matches or block them. Start
     # with "count", check what they'd block, then switch to "block".
     managed_rules_mode: ManagedRulesMode
+    # Bot Control's inspection level, or "off" to leave the paid group out.
+    bot_control: BotControlLevel
     # Encrypts the WAF log group and sets its retention.
     logs: LogEncryption
 
@@ -68,6 +110,7 @@ class Waf(pulumi.ComponentResource):
                                           until its rate drops back under the limit
       30  AWS common rule set             managed: count or block
       40  AWS known bad inputs            managed: count or block
+      50  AWS Bot Control (optional)      managed, paid: count or block
 
     Every rule publishes CloudWatch metrics and keeps sampled requests, so you
     can see what a rule matches before relying on it. Every request is also
@@ -86,6 +129,10 @@ class Waf(pulumi.ComponentResource):
             raise ValueError(f"rate_limit must be between 10 and 2,000,000,000, got {args.rate_limit}")
         if args.managed_rules_mode not in ("count", "block"):
             raise ValueError(f'managed_rules_mode must be "count" or "block", got "{args.managed_rules_mode}"')
+        if args.bot_control not in BOT_CONTROL_LEVELS:
+            raise ValueError(f'bot_control must be one of {BOT_CONTROL_LEVELS}, got "{args.bot_control}"')
+
+        groups = [*MANAGED_RULE_GROUPS, *([bot_control(args.bot_control)] if args.bot_control != "off" else [])]
 
         child_opts = pulumi.ResourceOptions(parent=self)
 
@@ -98,10 +145,10 @@ class Waf(pulumi.ComponentResource):
                 "priority": group.priority,
                 # Count overrides every rule in the group to count; none leaves their own (block) actions.
                 "override_action": {"count": {}} if args.managed_rules_mode == "count" else {"none": {}},
-                "statement": {"managed_rule_group_statement": {"vendor_name": "AWS", "name": group.name}},
+                "statement": {"managed_rule_group_statement": managed_statement(group)},
                 "visibility_config": visibility(f"{name}-{group.name}"),
             }
-            for group in MANAGED_RULE_GROUPS
+            for group in groups
         ]
 
         self.web_acl = aws.wafv2.WebAcl(
