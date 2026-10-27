@@ -19,7 +19,7 @@ class TierSecurityGroups(pulumi.ComponentResource):
     One security group per tier, chained by reference rather than by CIDR:
 
       internet ─443→ alb ─app_port→ app ─data_ports→ data
-                                 app ─443→ endpoints, internet (through NAT + firewall)
+                                 app ─443→ endpoints, internet (through NAT)
 
     Groups start with no rules (the provider removes AWS's default allow-all
     egress), so each rule below is the only way traffic is permitted.
@@ -88,7 +88,7 @@ class TierSecurityGroups(pulumi.ComponentResource):
             cidr_ipv4="0.0.0.0/0",
             from_port=443,
             to_port=443,
-            description="HTTPS to AWS APIs and allow-listed domains (filtered by Network Firewall)",
+            description="HTTPS to AWS APIs and the internet (through NAT)",
         )
 
         for port in args.data_ports:

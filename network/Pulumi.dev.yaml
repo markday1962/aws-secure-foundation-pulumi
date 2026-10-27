@@ -22,37 +22,6 @@ config:
   highly-secure-foundation-network:dataPorts:
     - 5432
 
-  # Domains workloads may resolve (DNS Firewall) and connect to (Network
-  # Firewall). Each entry includes its subdomains. Add what your apps need,
-  # e.g. registry.npmjs.org or pypi.org.
-  highly-secure-foundation-network:allowedDomains:
-    - amazonaws.com
-
-  # ~$865/month for 3 AZs plus $0.065/GB processed.
-  highly-secure-foundation-network:networkFirewall: true
-  # AWS managed rule groups, strict-order variants, checked before the domain
-  # allow-list. Names from the AWS Network Firewall developer guide. If
-  # `pulumi up` reports the policy is over capacity, remove some.
-  highly-secure-foundation-network:networkFirewallManagedRuleGroups:
-    - AbusedLegitMalwareDomainsStrictOrder
-    - MalwareDomainsStrictOrder
-    - AbusedLegitBotNetCommandAndControlDomainsStrictOrder
-    - BotNetCommandAndControlDomainsStrictOrder
-    - ThreatSignaturesBotnetStrictOrder
-    - ThreatSignaturesBotnetWebStrictOrder
-    - ThreatSignaturesMalwareStrictOrder
-    - ThreatSignaturesMalwareWebStrictOrder
-    - ThreatSignaturesMalwareCoinminingStrictOrder
-    - ThreatSignaturesEmergingEventsStrictOrder
-    - ThreatSignaturesIOCStrictOrder
-    - ThreatSignaturesPhishingStrictOrder
-
-  highly-secure-foundation-network:dnsFirewall: true
-  # IDs of the AWS managed DNS Firewall domain lists to block (malware,
-  # botnet C2, aggregate threat list, GuardDuty threat list). They differ by
-  # region; see the README for the command that lists them.
-  highly-secure-foundation-network:dnsFirewallManagedListIds: []
-
   # Interface endpoints (~$8/month each per AZ). ssm, ssmmessages and
   # ec2messages give Session Manager shell access with no SSH and no bastion.
   highly-secure-foundation-network:interfaceEndpoints:

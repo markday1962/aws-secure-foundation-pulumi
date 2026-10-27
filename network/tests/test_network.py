@@ -4,12 +4,12 @@ from typing import Any
 
 import pulumi
 import pytest
-from conftest import AZS, all_of, find, registered
+from conftest import AZS, MOCKS, all_of, registered
 
 from src.address_plan import address_plan
 from src.cidr import subnet_cidr
 from src.nacls import nacl_rules
-from src.network import DnsFirewallSettings, Network, NetworkArgs, NetworkFirewallSettings
+from src.network import Network, NetworkArgs
 
 ARGS = NetworkArgs(
     account_id="123456789012",
@@ -19,9 +19,6 @@ ARGS = NetworkArgs(
     nat_gateways="perAz",
     app_port=8443,
     data_ports=[5432],
-    allowed_domains=["amazonaws.com"],
-    network_firewall=NetworkFirewallSettings(enabled=True, managed_rule_groups=["MalwareDomainsStrictOrder"]),
-    dns_firewall=DnsFirewallSettings(enabled=True, managed_block_list_ids=[]),
     interface_endpoints=["ssm", "ssmmessages", "sts"],
     log_retention_days=365,
 )
@@ -60,11 +57,10 @@ def test_rejects_ranges_that_dont_fit() -> None:
 # ── address_plan
 
 
-def test_lays_out_four_tiers_without_overlap() -> None:
+def test_lays_out_three_tiers_without_overlap() -> None:
     plan = address_plan("10.0.0.0/16", 3)
     assert plan.tiers["app"] == ["10.0.0.0/19", "10.0.32.0/19", "10.0.64.0/19"]
     assert plan.tiers["public"] == ["10.0.96.0/24", "10.0.97.0/24", "10.0.98.0/24"]
-    assert plan.tiers["firewall"] == ["10.0.99.0/28", "10.0.99.16/28", "10.0.99.32/28"]
     assert plan.tiers["data"] == ["10.0.100.0/22", "10.0.104.0/22", "10.0.108.0/22"]
 
     def address_range(cidr: str) -> tuple[int, int]:
@@ -126,18 +122,18 @@ def network() -> None:
 
 @pytest.mark.usefixtures("network")
 class TestNetwork:
-    def test_routes_public_subnets_through_the_firewall_endpoint_in_their_own_az(self) -> None:
+    def test_routes_public_subnets_straight_to_the_internet_gateway(self) -> None:
+        route = registered("aws:ec2/route:Route", "t-public-internet")
+        assert route["gatewayId"] == "t_id"
         for az in AZS:
-            route = registered("aws:ec2/route:Route", f"t-public-{az}-internet")
-            assert route["vpcEndpointId"] == f"vpce-fw-{az}"
-            assert "gatewayId" not in route
+            assoc = registered("aws:ec2/routeTableAssociation:RouteTableAssociation", f"t-public-{az}")
+            assert assoc["routeTableId"] == "t-public_id"
 
-    def test_sends_return_traffic_from_the_igw_back_through_the_same_azs_firewall(self) -> None:
-        edge = registered("aws:ec2/routeTableAssociation:RouteTableAssociation", "t-igw-edge")
-        assert edge["gatewayId"] == "t_id"
-        back = registered("aws:ec2/route:Route", "t-igw-edge-eu-west-1b")
-        assert back["destinationCidrBlock"] == "10.0.97.0/24"
-        assert back["vpcEndpointId"] == "vpce-fw-eu-west-1b"
+    def test_creates_no_network_or_dns_firewall(self) -> None:
+        leftovers = [
+            r.typ for r in MOCKS.created if r.typ.startswith(("aws:networkfirewall/", "aws:route53/resolverFirewall"))
+        ]
+        assert leftovers == []
 
     def test_sends_each_app_subnets_internet_traffic_to_the_nat_gateway_in_its_own_az(self) -> None:
         for az in AZS:
@@ -157,27 +153,6 @@ class TestNetwork:
         registered("aws:ec2/routeTable:RouteTable", "t-data")
         data_routes = [r for r in all_of("aws:ec2/route:Route") if r.inputs.get("routeTableId") == "t-data_id"]
         assert data_routes == []
-
-    def test_denies_by_default_in_the_firewall_policy(self) -> None:
-        fp = registered("aws:networkfirewall/firewallPolicy:FirewallPolicy", "t-nfw")["firewallPolicy"]
-        assert fp["statefulEngineOptions"]["ruleOrder"] == "STRICT_ORDER"
-        assert fp["statefulDefaultActions"] == ["aws:drop_established", "aws:alert_established"]
-        assert (
-            fp["statefulRuleGroupReferences"][0]["resourceArn"]
-            == "arn:aws:network-firewall:eu-west-1:aws-managed:stateful-rulegroup/MalwareDomainsStrictOrder"
-        )
-
-    def test_allow_lists_domains_and_their_subdomains(self) -> None:
-        group = registered("aws:networkfirewall/ruleGroup:RuleGroup", "t-nfw-allow-domains")
-        assert group["ruleGroup"]["rulesSource"]["rulesSourceList"]["targets"] == ["amazonaws.com", ".amazonaws.com"]
-
-    def test_runs_dns_firewall_as_a_walled_garden_that_fails_closed(self) -> None:
-        allow = registered("aws:route53/resolverFirewallRule:ResolverFirewallRule", "t-dns-allow")
-        block = registered("aws:route53/resolverFirewallRule:ResolverFirewallRule", "t-dns-block-rest")
-        assert allow["priority"] < block["priority"]
-        assert block["action"] == "BLOCK"
-        config = registered("aws:route53/resolverFirewallConfig:ResolverFirewallConfig", "t-dns")
-        assert config["firewallFailOpen"] == "DISABLED"
 
     def test_locks_down_the_default_security_group_and_network_acl(self) -> None:
         sg = registered("aws:ec2/defaultSecurityGroup:DefaultSecurityGroup", "t")
@@ -212,16 +187,3 @@ class TestNetwork:
             if r.inputs.get("securityGroupId") == "t-sg-data_id"
         ]
         assert data_egress == []
-
-    def test_routes_straight_to_the_igw_when_the_firewall_is_off(self) -> None:
-        build(
-            "nofw",
-            replace(
-                ARGS,
-                network_firewall=NetworkFirewallSettings(enabled=False, managed_rule_groups=[]),
-                dns_firewall=DnsFirewallSettings(enabled=False, managed_block_list_ids=[]),
-            ),
-        )
-        route = registered("aws:ec2/route:Route", "nofw-public-eu-west-1a-internet")
-        assert route["gatewayId"] == "nofw_id"
-        assert find("aws:ec2/routeTableAssociation:RouteTableAssociation", "nofw-igw-edge") is None

@@ -16,8 +16,8 @@ class LogEncryptionArgs:
 
 class LogEncryption(pulumi.ComponentResource):
     """
-    A customer-managed KMS key for this VPC's logs (flow logs, firewall logs,
-    DNS query logs), and a factory for log groups encrypted with it.
+    A customer-managed KMS key for this VPC's logs (flow logs, and later
+    load balancer and WAF logs), and a factory for log groups encrypted with it.
     """
 
     key: aws.kms.Key
@@ -30,7 +30,7 @@ class LogEncryption(pulumi.ComponentResource):
 
         self.key = aws.kms.Key(
             name,
-            description="Encrypts VPC flow, firewall and DNS query logs",
+            description="Encrypts VPC network logs",
             enable_key_rotation=True,
             deletion_window_in_days=30,
             policy=policy_document(

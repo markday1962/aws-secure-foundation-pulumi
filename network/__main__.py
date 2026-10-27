@@ -2,7 +2,7 @@ import re
 
 import pulumi
 
-from src.network import DnsFirewallSettings, Network, NetworkArgs, NetworkFirewallSettings
+from src.network import Network, NetworkArgs
 
 config = pulumi.Config()
 aws_config = pulumi.Config("aws")
@@ -28,15 +28,6 @@ network = Network(
         nat_gateways=nat_gateways,
         app_port=config.get_int("appPort", default=8443),
         data_ports=config.get_object("dataPorts", default=[5432]),
-        allowed_domains=config.require_object("allowedDomains"),
-        network_firewall=NetworkFirewallSettings(
-            enabled=config.get_bool("networkFirewall", default=True),
-            managed_rule_groups=config.require_object("networkFirewallManagedRuleGroups"),
-        ),
-        dns_firewall=DnsFirewallSettings(
-            enabled=config.get_bool("dnsFirewall", default=True),
-            managed_block_list_ids=config.get_object("dnsFirewallManagedListIds", default=[]),
-        ),
         interface_endpoints=config.get_object("interfaceEndpoints", default=[]),
         log_retention_days=config.get_int("logRetentionDays", default=365),
     ),

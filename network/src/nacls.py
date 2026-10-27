@@ -108,11 +108,6 @@ def nacl_rules(plan: AddressPlan, app_port: int, data_ports: list[int]) -> dict[
             ),
             egress=rules([*(tcp(c, EPHEMERAL) for c in app), *(all_traffic(c) for c in data)]),
         ),
-        # Network Firewall must see all traffic to inspect it; AWS advises against filtering its subnets.
-        "firewall": TierNacl(
-            ingress=rules([all_traffic(ANYWHERE)]),
-            egress=rules([all_traffic(ANYWHERE)]),
-        ),
     }
 
     for tier, nacl in result.items():
