@@ -17,6 +17,10 @@ from src.waf import MANAGED_RULE_GROUPS, Waf, WafArgs
 
 # Everything Network deploys, switched on.
 FULL = Features(
+    vpc=True,
+    public_subnets=True,
+    app_subnets=True,
+    data_subnets=True,
     internet_gateway=True,
     nat_gateways="perAz",
     network_acls=True,
@@ -223,45 +227,95 @@ def types_for(name: str) -> set[str]:
     return {r.typ for r in MOCKS.created if r.name == name or r.name.startswith(f"{name}-")}
 
 
-CORE = {
+def subnets_for(name: str) -> list[str]:
+    return sorted(r.name for r in all_of("aws:ec2/subnet:Subnet") if r.name.startswith(f"{name}-"))
+
+
+VPC_ONLY = {
     "learning:network:Network",
     "aws:ec2/vpc:Vpc",
-    "aws:ec2/subnet:Subnet",
-    "aws:ec2/routeTable:RouteTable",
-    "aws:ec2/routeTableAssociation:RouteTableAssociation",
     "aws:ec2/defaultNetworkAcl:DefaultNetworkAcl",
     "aws:ec2/defaultSecurityGroup:DefaultSecurityGroup",
 }
 
 
-def test_deploys_only_the_vpc_and_its_subnets_by_default() -> None:
-    build("core", replace(ARGS, features=Features()))
-    assert types_for("core") == CORE
-    subnets = [r for r in all_of("aws:ec2/subnet:Subnet") if r.name.startswith("core-")]
-    assert len(subnets) == 9  # three tiers in three AZs
-    routes = [r for r in all_of("aws:ec2/route:Route") if r.name.startswith("core-")]
-    assert routes == []
+def test_switches_everything_off_by_default() -> None:
+    assert Features() == Features(
+        vpc=False,
+        public_subnets=False,
+        app_subnets=False,
+        data_subnets=False,
+        internet_gateway=False,
+        nat_gateways="none",
+        network_acls=False,
+        security_groups=False,
+        gateway_endpoints=False,
+        interface_endpoints=[],
+        flow_logs=False,
+        load_balancer=False,
+        waf=False,
+    )
+    with pytest.raises(ValueError, match="Network needs features.vpc"):
+        Network("novpc", replace(ARGS, features=Features()))
 
 
-def test_adds_only_the_internet_gateway_and_its_route_when_that_alone_is_switched_on() -> None:
-    build("igw", replace(ARGS, features=Features(internet_gateway=True)))
-    assert types_for("igw") == CORE | {"aws:ec2/internetGateway:InternetGateway", "aws:ec2/route:Route"}
-    registered("aws:ec2/route:Route", "igw-public-internet")
+def test_deploys_only_the_locked_down_vpc_when_only_it_is_on() -> None:
+    build("vpconly", replace(ARGS, features=Features(vpc=True)))
+    assert types_for("vpconly") == VPC_ONLY
+
+
+def test_protects_the_vpc_against_deletion() -> None:
+    network: list[Network] = []
+
+    @pulumi.runtime.test
+    def run() -> None:
+        network.append(Network("prot", replace(ARGS, features=Features(vpc=True))))
+
+    run()
+    assert network[0].vpc._protect is True
+
+
+def test_deploys_a_subnet_tier_on_its_own_at_its_planned_addresses() -> None:
+    build("dataonly", replace(ARGS, features=Features(vpc=True, data_subnets=True, network_acls=True)))
+    assert subnets_for("dataonly") == [f"dataonly-data-{az}" for az in AZS]
+    assert [registered("aws:ec2/subnet:Subnet", f"dataonly-data-{az}")["cidrBlock"] for az in AZS] == PLAN.tiers["data"]
+    assert types_for("dataonly") == VPC_ONLY | {
+        "aws:ec2/subnet:Subnet",
+        "aws:ec2/routeTable:RouteTable",
+        "aws:ec2/routeTableAssociation:RouteTableAssociation",
+        "aws:ec2/networkAcl:NetworkAcl",
+    }
+    # Network ACLs only for the tiers that exist.
+    nacls = [r.name for r in all_of("aws:ec2/networkAcl:NetworkAcl") if r.name.startswith("dataonly-")]
+    assert nacls == ["dataonly-data"]
+
+
+def test_adds_only_the_internet_gateway_and_its_route_when_that_is_switched_on() -> None:
+    build("igw", replace(ARGS, features=Features(vpc=True, public_subnets=True)))
+    build("igw2", replace(ARGS, features=Features(vpc=True, public_subnets=True, internet_gateway=True)))
+    assert types_for("igw2") - types_for("igw") == {"aws:ec2/internetGateway:InternetGateway", "aws:ec2/route:Route"}
+    registered("aws:ec2/route:Route", "igw2-public-internet")
 
 
 def test_creates_the_log_key_only_when_something_logs() -> None:
-    build("fl", replace(ARGS, features=Features(flow_logs=True)))
+    build("fl", replace(ARGS, features=Features(vpc=True, flow_logs=True)))
     registered("aws:kms/key:Key", "fl-logs")
     registered("aws:ec2/flowLog:FlowLog", "fl")
-    assert Features(flow_logs=True).log_encryption
-    assert Features(
-        internet_gateway=True, network_acls=True, security_groups=True, load_balancer=True, waf=True
-    ).log_encryption
-    assert not Features().log_encryption
+    with_waf = Features(
+        vpc=True,
+        public_subnets=True,
+        internet_gateway=True,
+        network_acls=True,
+        security_groups=True,
+        load_balancer=True,
+        waf=True,
+    )
+    assert with_waf.log_encryption
+    assert not Features(vpc=True).log_encryption
 
 
 def test_creates_gateway_endpoints_without_interface_endpoints() -> None:
-    build("gw", replace(ARGS, features=Features(network_acls=True, gateway_endpoints=True)))
+    build("gw", replace(ARGS, features=Features(vpc=True, app_subnets=True, network_acls=True, gateway_endpoints=True)))
     endpoints = sorted(r.name for r in all_of("aws:ec2/vpcEndpoint:VpcEndpoint") if r.name.startswith("gw-"))
     assert endpoints == ["gw-vpce-dynamodb", "gw-vpce-s3"]
 
@@ -269,11 +323,36 @@ def test_creates_gateway_endpoints_without_interface_endpoints() -> None:
 @pytest.mark.parametrize(
     ("features", "message"),
     [
-        ({"nat_gateways": "single"}, "nat_gateways needs internet_gateway and network_acls"),
-        ({"nat_gateways": "perAz", "internet_gateway": True}, "nat_gateways needs network_acls"),
-        ({"gateway_endpoints": True}, "gateway_endpoints needs network_acls"),
-        ({"interface_endpoints": ["ssm"], "network_acls": True}, "interface_endpoints needs security_groups"),
-        ({"load_balancer": True}, "load_balancer needs internet_gateway and network_acls and security_groups"),
+        ({"public_subnets": True}, "public_subnets needs vpc"),
+        ({"app_subnets": True}, "app_subnets needs vpc"),
+        ({"data_subnets": True}, "data_subnets needs vpc"),
+        ({"network_acls": True}, "network_acls needs vpc"),
+        ({"security_groups": True}, "security_groups needs vpc"),
+        ({"flow_logs": True}, "flow_logs needs vpc"),
+        ({"vpc": True, "internet_gateway": True}, "internet_gateway needs public_subnets"),
+        (
+            {"vpc": True, "nat_gateways": "single"},
+            "nat_gateways needs public_subnets and app_subnets and internet_gateway and network_acls",
+        ),
+        (
+            {
+                "vpc": True,
+                "public_subnets": True,
+                "app_subnets": True,
+                "internet_gateway": True,
+                "nat_gateways": "perAz",
+            },
+            "nat_gateways needs network_acls",
+        ),
+        ({"vpc": True, "network_acls": True, "gateway_endpoints": True}, "gateway_endpoints needs app_subnets"),
+        (
+            {"vpc": True, "app_subnets": True, "network_acls": True, "interface_endpoints": ["ssm"]},
+            "interface_endpoints needs security_groups",
+        ),
+        (
+            {"vpc": True, "load_balancer": True},
+            "load_balancer needs public_subnets and internet_gateway and network_acls and security_groups",
+        ),
         ({"waf": True}, "waf needs load_balancer"),
         ({"nat_gateways": "always"}, "nat_gateways must be one of"),
     ],
@@ -493,6 +572,11 @@ class TestWaf:
     def test_protects_the_load_balancer(self) -> None:
         assoc = registered("aws:wafv2/webAclAssociation:WebAclAssociation", "waf")
         assert assoc == {"resourceArn": "arn:aws:elasticloadbalancing:alb", "webAclArn": "arn:aws:mock:::waf"}
+
+
+def test_refuses_an_alb_in_fewer_than_two_azs() -> None:
+    with pytest.raises(ValueError, match="at least two availability zones"):
+        LoadBalancer("one-az", replace(LB_ARGS, subnet_ids=["subnet-a"]))
 
 
 def test_rejects_rate_windows_limits_and_modes_aws_waf_doesnt_support() -> None:

@@ -154,31 +154,45 @@ group and NACL limit it to port 443, and nothing more.
 
 ## Controlled deployment
 
-The network stack deploys almost nothing by default. Only the VPC, its nine
-subnets and their route tables are always there, plus the default security
-group and default network ACL with every rule removed. That VPC carries no
-traffic at all, and costs nothing.
-
-Everything else is a feature flag in `network/Pulumi.dev.yaml`, off until you
+The network stack deploys nothing by default. Every part of it, starting with
+the VPC itself, is a feature flag in `network/Pulumi.dev.yaml`, off until you
 switch it on. Bring the network up one `pulumi up` at a time, checking
 `pulumi preview` before each:
 
 | Step | Flag | Needs | Adds | Cost |
 |---|---|---|---|---|
-| 1 | `networkAcls: true` | | a network ACL per tier; until then every subnet uses the deny-all default ACL | free |
-| 1 | `securityGroups: true` | | the ALB, app, data and endpoint security groups | free |
-| 1 | `flowLogs: true` | | VPC flow logs, the KMS log key | log volume |
-| 2 | `internetGateway: true` | | the Internet Gateway and the public subnets' route to it | free |
-| 2 | `gatewayEndpoints: true` | `networkAcls` | S3 and DynamoDB gateway endpoints | free |
-| 3 | `natGateways: single` or `perAz` | `internetGateway`, `networkAcls` | NAT gateways and the app tier's route out | ~$35 each |
-| 4 | `interfaceEndpoints: [ssm, …]` | `networkAcls`, `securityGroups` | interface endpoints | ~$8 each per AZ |
-| 5 | `loadBalancer: true` | `internetGateway`, `networkAcls`, `securityGroups` | the ALB, its certificate, DNS record and log bucket | ~$18 + LCUs |
-| 6 | `waf: true` | `loadBalancer` | the WAF web ACL and its logs (and the KMS log key) | ~$20 + per request |
+| 1 | `vpc: true` | | the VPC, with its default security group and network ACL stripped of every rule; **protected** (see below) | free |
+| 2 | `publicSubnets: true` | `vpc` | a public subnet per AZ and their route table | free |
+| 2 | `appSubnets: true` | `vpc` | an app subnet per AZ and a route table each | free |
+| 2 | `dataSubnets: true` | `vpc` | a data subnet per AZ and their route table | free |
+| 3 | `networkAcls: true` | `vpc` | a network ACL for each tier that exists; until then every subnet uses the deny-all default ACL | free |
+| 3 | `securityGroups: true` | `vpc` | the ALB, app, data and endpoint security groups | free |
+| 3 | `flowLogs: true` | `vpc` | VPC flow logs, the KMS log key | log volume |
+| 4 | `internetGateway: true` | `publicSubnets` | the Internet Gateway and the public subnets' route to it | free |
+| 4 | `gatewayEndpoints: true` | `appSubnets`, `networkAcls` | S3 and DynamoDB gateway endpoints | free |
+| 5 | `natGateways: single` or `perAz` | `publicSubnets`, `appSubnets`, `internetGateway`, `networkAcls` | NAT gateways and the app tier's route out | ~$35 each |
+| 6 | `interfaceEndpoints: [ssm, …]` | `appSubnets`, `networkAcls`, `securityGroups` | interface endpoints | ~$8 each per AZ |
+| 7 | `loadBalancer: true` | `publicSubnets`, `internetGateway`, `networkAcls`, `securityGroups` | the ALB, its certificate, DNS record and log bucket (needs at least two AZs) | ~$18 + LCUs |
+| 8 | `waf: true` | `loadBalancer` | the WAF web ACL and its logs (and the KMS log key) | ~$20 + per request |
 
 The stack refuses to run if a flag is on without what it needs, for example
 `waf needs load_balancer switched on too`. Turning a flag back off removes
 what it added on the next `pulumi up`. The exported `features` output shows
 what a stack has switched on.
+
+Each tier's subnets have fixed addresses in the VPC (see the diagram above),
+whether or not the tier is deployed, so switching one tier on or off never
+moves another.
+
+**The VPC is protected.** Once it's deployed, switching `vpc` back off makes
+`pulumi up` fail rather than delete the VPC and everything in it. To remove
+it on purpose, switch every other flag off first, then:
+
+```sh
+cd network
+pulumi state unprotect --all      # the VPC is the only protected resource in this stack
+pulumi up                         # with vpc: false, now deletes it
+```
 
 ## Running it
 
@@ -190,14 +204,14 @@ format and lint, pyright and pytest. It never touches AWS.
 
 ```sh
 make install                              # a .venv in each project
-make test                                 # 58 unit tests across both projects, no AWS needed
+make test                                 # 69 unit tests across both projects, no AWS needed
 make lint                                 # ruff and pyright
 
 pulumi login --local                      # local state while learning
 export AWS_PROFILE=<sandbox profile>
 
 cd account-baseline && pulumi stack init dev && pulumi up
-cd ../network       && pulumi stack init dev && pulumi up      # the VPC and subnets only
+cd ../network       && pulumi stack init dev && pulumi up      # nothing yet: every flag is off
 
 # Then switch features on step by step (see above). Once loadBalancer and waf are on:
 curl -I http://app.example.com            # 301, Location: https://app.example.com:443/
@@ -231,7 +245,9 @@ cuts every AZ's internet access) or trim `interfaceEndpoints` in
 
 ## Tearing down
 
-- `network`: run `pulumi destroy`. ALB `albDeletionProtection` is off for
+- `network`: the VPC is protected, so unprotect it first (see
+  [Controlled deployment](#controlled-deployment)), then run `pulumi destroy`.
+  ALB `albDeletionProtection` is off for
   learning; turn it on for anything real. The ALB access-log bucket is
   emptied and deleted with the stack.
 - **GuardDuty runtime monitoring** creates its own VPC endpoint and security

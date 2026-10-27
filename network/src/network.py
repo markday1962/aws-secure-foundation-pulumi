@@ -39,13 +39,14 @@ class Network(pulumi.ComponentResource):
     all, network ACLs which tiers may talk, and security groups which resources.
     Flow logs record it all, encrypted with a customer-managed key.
 
-    Only the VPC, its subnets and route tables, and the locked-down default
-    security group and network ACL are always deployed. The rest is switched
-    on through `features` (see features.py); left off, the VPC carries no
-    traffic at all.
+    Everything is switched on through `features` (see features.py), starting
+    with the VPC itself and each subnet tier. The VPC is protected: once it's
+    deployed, Pulumi refuses to delete it until it's deliberately unprotected.
+    Create a Network only when `features.vpc` is on.
     """
 
     vpc: aws.ec2.Vpc
+    # One subnet per AZ for each tier that's switched on; empty for the others.
     subnets: dict[Tier, list[aws.ec2.Subnet]]
     # None unless features.security_groups.
     security_groups: TierSecurityGroups | None
@@ -57,8 +58,13 @@ class Network(pulumi.ComponentResource):
     def __init__(self, name: str, args: NetworkArgs, opts: pulumi.ResourceOptions | None = None):
         super().__init__("learning:network:Network", name, {}, opts)
 
-        plan = address_plan(args.cidr, len(args.availability_zones))
         features = args.features
+        if not features.vpc:
+            raise ValueError("Network needs features.vpc switched on")
+
+        # Every tier's addresses are fixed by the plan, whether or not the tier
+        # is deployed, so switching a tier on never moves another.
+        plan = address_plan(args.cidr, len(args.availability_zones))
         azs = args.availability_zones
         child_opts = pulumi.ResourceOptions(parent=self)
 
@@ -83,10 +89,12 @@ class Network(pulumi.ComponentResource):
             enable_dns_support=True,
             enable_dns_hostnames=True,
             tags=tag("vpc"),
-            opts=child_opts,
+            # Switching the VPC off would take everything in it down; Pulumi
+            # refuses until it's deliberately unprotected.
+            opts=pulumi.ResourceOptions(parent=self, protect=True),
         )
 
-        # ── Subnets: one per tier per AZ. None assign public IPs automatically.
+        # ── Subnets: one per AZ for each tier that's on. None assign public IPs automatically.
         def make_subnets(tier: Tier) -> list[aws.ec2.Subnet]:
             return [
                 aws.ec2.Subnet(
@@ -101,11 +109,12 @@ class Network(pulumi.ComponentResource):
                 for i, az in enumerate(azs)
             ]
 
-        self.subnets = {
-            "public": make_subnets("public"),
-            "app": make_subnets("app"),
-            "data": make_subnets("data"),
+        tiers_on: dict[Tier, bool] = {
+            "public": features.public_subnets,
+            "app": features.app_subnets,
+            "data": features.data_subnets,
         }
+        self.subnets = {tier: make_subnets(tier) if on else [] for tier, on in tiers_on.items()}
 
         # ── Ingress: the Internet Gateway.
         igw = (
@@ -123,17 +132,18 @@ class Network(pulumi.ComponentResource):
             )
 
         # Public subnets: straight out through the Internet Gateway, if there is one.
-        public_table = route_table("public")
-        if igw:
-            aws.ec2.Route(
-                f"{name}-public-internet",
-                route_table_id=public_table.id,
-                destination_cidr_block="0.0.0.0/0",
-                gateway_id=igw.id,
-                opts=child_opts,
-            )
-        for i, az in enumerate(azs):
-            associate(f"public-{az}", self.subnets["public"][i], public_table)
+        if self.subnets["public"]:
+            public_table = route_table("public")
+            if igw:
+                aws.ec2.Route(
+                    f"{name}-public-internet",
+                    route_table_id=public_table.id,
+                    destination_cidr_block="0.0.0.0/0",
+                    gateway_id=igw.id,
+                    opts=child_opts,
+                )
+            for i, az in enumerate(azs):
+                associate(f"public-{az}", self.subnets["public"][i], public_table)
 
         # ── Egress: NAT gateways in the public subnets.
         nat_azs = {"none": [], "single": azs[:1], "perAz": azs}[features.nat_gateways]
@@ -153,7 +163,7 @@ class Network(pulumi.ComponentResource):
         # App subnets: internet traffic via NAT, if there is one. One table per
         # AZ so each can use its own NAT.
         app_tables: list[aws.ec2.RouteTable] = []
-        for i, az in enumerate(azs):
+        for i, az in enumerate(azs if self.subnets["app"] else []):
             table = route_table(f"app-{az}")
             if self.nat_gateways:
                 nat = self.nat_gateways[i if features.nat_gateways == "perAz" else 0]
@@ -168,15 +178,18 @@ class Network(pulumi.ComponentResource):
             app_tables.append(table)
 
         # Data subnets: no default route at all. They can reach only the VPC.
-        data_table = route_table("data")
-        for i, az in enumerate(azs):
-            associate(f"data-{az}", self.subnets["data"][i], data_table)
+        if self.subnets["data"]:
+            data_table = route_table("data")
+            for i, az in enumerate(azs):
+                associate(f"data-{az}", self.subnets["data"][i], data_table)
 
         # ── Network ACLs per tier, and the default ACL stripped of its allow-all
         # rules. Without the tier ACLs, every subnet falls back to the default
         # ACL, so the VPC carries no traffic.
         if features.network_acls:
             for tier, nacl in nacl_rules(plan, args.app_port, args.data_ports).items():
+                if not self.subnets[tier]:
+                    continue
                 aws.ec2.NetworkAcl(
                     f"{name}-{tier}",
                     vpc_id=self.vpc.id,

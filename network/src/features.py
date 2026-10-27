@@ -9,15 +9,24 @@ NAT_MODES = ("none", "single", "perAz")
 @dataclass(frozen=True)
 class Features:
     """
-    Which parts of the network to deploy. The VPC, its subnets and route
-    tables, and the locked-down default security group and network ACL are
-    always deployed. Everything else is off until switched on, so
-    infrastructure can be brought up one controlled step at a time.
+    Which parts of the network to deploy. Everything is off until switched on,
+    so infrastructure can be brought up one controlled step at a time, starting
+    from nothing at all.
 
-    Without network_acls, every subnet uses the VPC's default network ACL,
-    which denies all traffic. So anything that carries traffic needs it too.
+    The VPC comes with its locked-down default security group and network ACL.
+    Each subnet tier comes with its route table(s). Without network_acls, every
+    subnet uses the VPC's default network ACL, which denies all traffic, so
+    anything that carries traffic needs it too.
     """
 
+    # The VPC, with its default security group and network ACL stripped of
+    # every rule. It's protected: once deployed, switching it off fails until
+    # it's deliberately unprotected (see the README).
+    vpc: bool = False
+    # Subnets per tier, one per AZ, each with its route table(s).
+    public_subnets: bool = False
+    app_subnets: bool = False
+    data_subnets: bool = False
     # Internet Gateway, and the public subnets' default route to it.
     internet_gateway: bool = False
     # NAT gateways for the app tier's outbound internet access.
@@ -42,10 +51,29 @@ class Features:
             raise ValueError(f'nat_gateways must be one of {NAT_MODES}, got "{self.nat_gateways}"')
 
         requirements = [
-            (self.nat_gateways != "none", "nat_gateways", ["internet_gateway", "network_acls"]),
-            (self.gateway_endpoints, "gateway_endpoints", ["network_acls"]),
-            (bool(self.interface_endpoints), "interface_endpoints", ["network_acls", "security_groups"]),
-            (self.load_balancer, "load_balancer", ["internet_gateway", "network_acls", "security_groups"]),
+            (self.public_subnets, "public_subnets", ["vpc"]),
+            (self.app_subnets, "app_subnets", ["vpc"]),
+            (self.data_subnets, "data_subnets", ["vpc"]),
+            (self.network_acls, "network_acls", ["vpc"]),
+            (self.security_groups, "security_groups", ["vpc"]),
+            (self.flow_logs, "flow_logs", ["vpc"]),
+            (self.internet_gateway, "internet_gateway", ["public_subnets"]),
+            (
+                self.nat_gateways != "none",
+                "nat_gateways",
+                ["public_subnets", "app_subnets", "internet_gateway", "network_acls"],
+            ),
+            (self.gateway_endpoints, "gateway_endpoints", ["app_subnets", "network_acls"]),
+            (
+                bool(self.interface_endpoints),
+                "interface_endpoints",
+                ["app_subnets", "network_acls", "security_groups"],
+            ),
+            (
+                self.load_balancer,
+                "load_balancer",
+                ["public_subnets", "internet_gateway", "network_acls", "security_groups"],
+            ),
             (self.waf, "waf", ["load_balancer"]),
         ]
         for enabled, feature, needs in requirements:
