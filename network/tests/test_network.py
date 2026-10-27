@@ -11,7 +11,7 @@ from src.cidr import subnet_cidr
 from src.load_balancer import SSL_POLICY, LoadBalancer, LoadBalancerArgs
 from src.nacls import nacl_rules
 from src.network import Network, NetworkArgs
-from src.waf import Waf, WafArgs
+from src.waf import MANAGED_RULE_GROUPS, Waf, WafArgs
 
 ARGS = NetworkArgs(
     account_id="123456789012",
@@ -293,7 +293,24 @@ class TestLoadBalancer:
 def waf() -> None:
     @pulumi.runtime.test
     def run() -> None:
-        Waf("waf", WafArgs(alb_arn="arn:aws:elasticloadbalancing:alb", rate_limit=500, rate_window_sec=120))
+        Waf(
+            "waf",
+            WafArgs(
+                alb_arn="arn:aws:elasticloadbalancing:alb",
+                rate_limit=500,
+                rate_window_sec=120,
+                managed_rules_mode="count",
+            ),
+        )
+        Waf(
+            "waf-block",
+            WafArgs(
+                alb_arn="arn:aws:elasticloadbalancing:alb",
+                rate_limit=500,
+                rate_window_sec=120,
+                managed_rules_mode="block",
+            ),
+        )
 
     run()
 
@@ -308,7 +325,7 @@ class TestWaf:
 
     def test_blocks_ips_over_the_rate_limit_with_429_and_retry_after(self) -> None:
         acl = registered("aws:wafv2/webAcl:WebAcl", "waf")
-        (rule,) = acl["rules"]
+        (rule,) = [r for r in acl["rules"] if r["name"] == "rate-limit-per-ip"]
         assert rule["statement"]["rateBasedStatement"] == {
             "aggregateKeyType": "IP",
             "limit": 500,
@@ -321,6 +338,33 @@ class TestWaf:
         assert response["customResponseBodyKey"] in bodies
         assert rule["visibilityConfig"]["sampledRequestsEnabled"] is True
 
+    def test_runs_the_aws_managed_rule_groups_in_count_mode(self) -> None:
+        rules = {r["name"]: r for r in registered("aws:wafv2/webAcl:WebAcl", "waf")["rules"]}
+        for group in MANAGED_RULE_GROUPS:
+            rule = rules[group.name]
+            assert rule["statement"]["managedRuleGroupStatement"] == {"vendorName": "AWS", "name": group.name}
+            assert rule["overrideAction"] == {"count": {}}
+            assert "action" not in rule
+            assert rule["visibilityConfig"]["sampledRequestsEnabled"] is True
+
+    def test_lets_the_managed_rule_groups_block_in_block_mode(self) -> None:
+        rules = registered("aws:wafv2/webAcl:WebAcl", "waf-block")["rules"]
+        managed = [r for r in rules if "managedRuleGroupStatement" in r["statement"]]
+        assert len(managed) == len(MANAGED_RULE_GROUPS)
+        assert all(r["overrideAction"] == {"none": {}} for r in managed)
+
+    def test_checks_ip_reputation_before_the_rate_limit_and_the_rest_after(self) -> None:
+        order = [
+            r["name"]
+            for r in sorted(registered("aws:wafv2/webAcl:WebAcl", "waf")["rules"], key=lambda r: r["priority"])
+        ]
+        assert order == [
+            "AWSManagedRulesAmazonIpReputationList",
+            "rate-limit-per-ip",
+            "AWSManagedRulesCommonRuleSet",
+            "AWSManagedRulesKnownBadInputsRuleSet",
+        ]
+
     def test_protects_the_load_balancer(self) -> None:
         assoc = registered("aws:wafv2/webAclAssociation:WebAclAssociation", "waf")
         assert assoc == {"resourceArn": "arn:aws:elasticloadbalancing:alb", "webAclArn": "arn:aws:mock:::waf"}
@@ -328,6 +372,8 @@ class TestWaf:
 
 def test_rejects_rate_windows_and_limits_aws_waf_doesnt_support() -> None:
     with pytest.raises(ValueError, match="rate_window_sec must be one of"):
-        Waf("bad-window", WafArgs(alb_arn="x", rate_limit=500, rate_window_sec=90))
+        Waf("bad-window", WafArgs(alb_arn="x", rate_limit=500, rate_window_sec=90, managed_rules_mode="count"))
     with pytest.raises(ValueError, match="rate_limit must be between"):
-        Waf("bad-limit", WafArgs(alb_arn="x", rate_limit=5, rate_window_sec=300))
+        Waf("bad-limit", WafArgs(alb_arn="x", rate_limit=5, rate_window_sec=300, managed_rules_mode="count"))
+    with pytest.raises(ValueError, match="managed_rules_mode must be"):
+        Waf("bad-mode", WafArgs(alb_arn="x", rate_limit=500, rate_window_sec=300, managed_rules_mode="on"))  # pyright: ignore[reportArgumentType]

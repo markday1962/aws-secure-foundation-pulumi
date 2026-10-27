@@ -78,12 +78,17 @@ pulumi.export(
 )
 pulumi.export("natGatewayIds", [n.id for n in network.nat_gateways])
 pulumi.export("logKeyArn", network.log_key.arn)
+waf_managed_rules_mode = config.get("wafManagedRulesMode", default="count")
+if waf_managed_rules_mode not in ("count", "block"):
+    raise ValueError(f'wafManagedRulesMode must be "count" or "block", got "{waf_managed_rules_mode}"')
+
 waf = Waf(
     f"{prefix}-waf",
     WafArgs(
         alb_arn=alb.alb.arn,
         rate_limit=config.get_int("wafRateLimit", default=1000),
         rate_window_sec=config.get_int("wafRateWindowSec", default=300),
+        managed_rules_mode=waf_managed_rules_mode,
     ),
 )
 

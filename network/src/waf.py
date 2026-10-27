@@ -1,10 +1,36 @@
 from dataclasses import dataclass
+from typing import Literal
 
 import pulumi
 import pulumi_aws as aws
 
 # The evaluation windows AWS WAF supports for rate-based rules, in seconds.
 RATE_WINDOWS = (60, 120, 300, 600)
+
+# "count" records what a managed rule group would block (in metrics and sampled
+# requests) without blocking it; "block" lets each group's rules act.
+ManagedRulesMode = Literal["count", "block"]
+
+
+@dataclass(frozen=True)
+class ManagedRuleGroup:
+    # The AWS managed rule group, as AWS names it.
+    name: str
+    # Where it runs relative to the other rules (lower runs first).
+    priority: int
+
+
+# AWS managed rule groups, free with WAF. Together about 925 of the web ACL's
+# 1,500 WCU default capacity.
+MANAGED_RULE_GROUPS = [
+    # Addresses Amazon threat intelligence has seen attacking: checked before
+    # the rate limit, so known-bad clients don't use up any of it.
+    ManagedRuleGroup("AWSManagedRulesAmazonIpReputationList", priority=10),
+    # The OWASP Top 10 baseline: XSS, path traversal, oversized requests, bad bots, ...
+    ManagedRuleGroup("AWSManagedRulesCommonRuleSet", priority=30),
+    # Request patterns tied to known exploits, such as Log4j and Java deserialisation.
+    ManagedRuleGroup("AWSManagedRulesKnownBadInputsRuleSet", priority=40),
+]
 
 
 @dataclass(frozen=True)
@@ -15,15 +41,22 @@ class WafArgs:
     rate_limit: int
     # The window the limit is counted over, in seconds (60, 120, 300 or 600).
     rate_window_sec: int
+    # Whether the managed rule groups only count matches or block them. Start
+    # with "count", check what they'd block, then switch to "block".
+    managed_rules_mode: ManagedRulesMode
 
 
 class Waf(pulumi.ComponentResource):
     """
     AWS WAF in front of the ALB (SEC05-BP03, SEC06). The web ACL allows by
-    default; its rules block what they match, in priority order:
+    default; its rules match in priority order:
 
-      1. rate limit: any client IP over `rate_limit` requests per window gets
-         429 Too Many Requests until its rate drops back under the limit
+      10  AWS IP reputation list          managed: count or block
+      20  rate limit                      any client IP over `rate_limit` requests
+                                          per window gets 429 Too Many Requests
+                                          until its rate drops back under the limit
+      30  AWS common rule set             managed: count or block
+      40  AWS known bad inputs            managed: count or block
 
     Every rule publishes CloudWatch metrics and keeps sampled requests, so you
     can see what a rule matches before relying on it.
@@ -38,11 +71,25 @@ class Waf(pulumi.ComponentResource):
             raise ValueError(f"rate_window_sec must be one of {RATE_WINDOWS}, got {args.rate_window_sec}")
         if not 10 <= args.rate_limit <= 2_000_000_000:
             raise ValueError(f"rate_limit must be between 10 and 2,000,000,000, got {args.rate_limit}")
+        if args.managed_rules_mode not in ("count", "block"):
+            raise ValueError(f'managed_rules_mode must be "count" or "block", got "{args.managed_rules_mode}"')
 
         child_opts = pulumi.ResourceOptions(parent=self)
 
         def visibility(metric: str) -> aws.wafv2.WebAclVisibilityConfigArgsDict:
             return {"cloudwatch_metrics_enabled": True, "metric_name": metric, "sampled_requests_enabled": True}
+
+        managed_rules: list[aws.wafv2.WebAclRuleArgsDict] = [
+            {
+                "name": group.name,
+                "priority": group.priority,
+                # Count overrides every rule in the group to count; none leaves their own (block) actions.
+                "override_action": {"count": {}} if args.managed_rules_mode == "count" else {"none": {}},
+                "statement": {"managed_rule_group_statement": {"vendor_name": "AWS", "name": group.name}},
+                "visibility_config": visibility(f"{name}-{group.name}"),
+            }
+            for group in MANAGED_RULE_GROUPS
+        ]
 
         self.web_acl = aws.wafv2.WebAcl(
             name,
@@ -61,7 +108,7 @@ class Waf(pulumi.ComponentResource):
             rules=[
                 {
                     "name": "rate-limit-per-ip",
-                    "priority": 10,
+                    "priority": 20,
                     "action": {
                         "block": {
                             "custom_response": {
@@ -81,6 +128,7 @@ class Waf(pulumi.ComponentResource):
                     },
                     "visibility_config": visibility(f"{name}-rate-limit-per-ip"),
                 },
+                *managed_rules,
             ],
             visibility_config=visibility(name),
             opts=child_opts,

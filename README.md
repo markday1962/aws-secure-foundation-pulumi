@@ -10,7 +10,8 @@ Derived from
 with these changes: Network Firewall and DNS Firewall are removed; an ALB is
 added (HTTP redirects to HTTPS); and the account baseline closes the Security
 Hub gaps the original left open, adding alerting. **AWS WAF** sits in front of
-the ALB; it starts with per-IP rate limiting and more rules will follow.
+the ALB, with per-IP rate limiting and the AWS managed rule groups (in count
+mode to begin with).
 
 ```
 aws-secure-foundation-pulumi/
@@ -31,7 +32,8 @@ switch off your CloudTrail or GuardDuty.
 
 ```
                      Internet
-                        │  AWS WAF: per-IP rate limit → 429
+                        │  AWS WAF: IP reputation · rate limit → 429 ·
+                        │           common rule set · known bad inputs
                         │  :80 → 301 to :443
                         │  :443 TLS 1.2/1.3 (ACM certificate, app.example.com)
                 ┌───────▼────────┐
@@ -55,7 +57,24 @@ switch off your CloudTrail or GuardDuty.
 **Inbound:** client → IGW → AWS WAF → ALB. WAF blocks any client IP that
 makes more than `wafRateLimit` requests per `wafRateWindowSec` (default 1000
 per 5 minutes) with `429 Too Many Requests` and a `Retry-After` header, until
-its rate drops back under the limit. Port 80 only ever answers with a 301 to
+its rate drops back under the limit. Three AWS managed rule groups run
+around it:
+
+| Priority | Rule | What it matches |
+|---|---|---|
+| 10 | `AWSManagedRulesAmazonIpReputationList` | IPs Amazon threat intelligence has seen attacking (checked first, so they don't use up the rate limit) |
+| 20 | `rate-limit-per-ip` | any IP over the rate limit (always blocks) |
+| 30 | `AWSManagedRulesCommonRuleSet` | the OWASP Top 10 baseline: XSS, path traversal, oversized requests, bad bots |
+| 40 | `AWSManagedRulesKnownBadInputsRuleSet` | known exploit patterns such as Log4j and Java deserialisation |
+
+The managed groups start in **count mode** (`wafManagedRulesMode: count`):
+they record what they *would* block, in CloudWatch metrics
+(`AWS/WAFV2`, one metric per rule) and in the web ACL's sampled requests, but
+let it through. Watch them under real traffic, add exclusions for any false
+positives (the common rule set's `SizeRestrictions_BODY`, which matches bodies
+over 8 KB, is the usual one), then set `wafManagedRulesMode: block`.
+
+Port 80 only ever answers with a 301 to
 HTTPS. Port 443 terminates TLS with `ELBSecurityPolicy-TLS13-1-2-Res-2021-06`,
 adds HSTS, `nosniff` and `X-Frame-Options: DENY`, drops malformed headers, and
 for now returns a fixed `200 ok`. An empty HTTPS target group on `appPort` is
@@ -73,7 +92,7 @@ group and NACL limit it to port 443, and nothing more.
 | **SEC05-BP01** Create network layers | Three tiers: public, app, and isolated data. The data tier has no route outside the VPC. |
 | **SEC05-BP02** Control traffic in every layer | Route tables; network ACLs per tier; security groups that reference each other (internet → ALB → app → data); both ingress and egress controlled. |
 | **SEC05-BP02** Private access to services | S3 and DynamoDB gateway endpoints, plus 10 interface endpoints, with policies that admit only this account's principals (a data perimeter). |
-| **SEC05-BP03** Inspection-based protection | AWS WAF web ACL on the ALB: per-IP rate limiting (more rules to follow), with CloudWatch metrics and sampled requests per rule. |
+| **SEC05-BP03** Inspection-based protection | AWS WAF web ACL on the ALB: AWS IP reputation, common rule set and known bad inputs (count mode first), per-IP rate limiting, with CloudWatch metrics and sampled requests per rule. |
 | **SEC05-BP04** Automate network protection | All of it is code, with unit tests that check the rules. |
 | **SEC09** Protect data in transit | HTTP→HTTPS redirect, TLS 1.2/1.3 only, HSTS, TLS to the targets; buckets deny non-TLS requests. |
 | Lock down defaults (CIS 5.4) | Default security group and default network ACL both stripped of every rule. |
@@ -112,7 +131,7 @@ Needs Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
 ```sh
 make install                              # a .venv in each project
-make test                                 # 41 unit tests across both projects, no AWS needed
+make test                                 # 44 unit tests across both projects, no AWS needed
 make lint                                 # ruff and pyright
 
 pulumi login --local                      # local state while learning
@@ -135,7 +154,7 @@ for i in $(seq 1 1200); do curl -s -o /dev/null -w "%{http_code}\n" https://app.
 | Interface endpoints, 10 × 3 AZs | ~$240 + $0.01/GB |
 | NAT gateways, 1 per AZ × 3 | ~$105 + $0.048/GB |
 | Application Load Balancer | ~$18 + LCUs |
-| AWS WAF, 1 web ACL + 1 rule | ~$6 + $0.60 per million requests |
+| AWS WAF, 1 web ACL + 4 rules | ~$9 + $0.60 per million requests |
 | Public IPv4 addresses (NAT EIPs, ALB) | ~$20 |
 | GuardDuty, Security Hub, Config | usage-based; usually tens of dollars in a quiet account |
 | KMS keys (2), logs, alarms (14), Route 53 zone | a few dollars |
@@ -164,8 +183,8 @@ cuts every AZ's internet access) or trim `interfaceEndpoints` in
 
 ## What's deliberately not here
 
-- **More WAF rules**: AWS managed rule groups (common rule set, known bad
-  inputs, IP reputation), geo rules and WAF logging are still to come.
+- **More WAF**: WAF logging, geo rules, and the paid managed groups (Bot
+  Control, Account Takeover Prevention) are still to come.
 - **Egress filtering by destination**: Network Firewall and DNS Firewall were
   removed. To bring domain filtering back cheaply, re-add a Route 53 DNS
   Firewall allow-list.

@@ -35,6 +35,10 @@ config:
   # drops back under the limit.
   highly-secure-foundation-network:wafRateLimit: 1000
   highly-secure-foundation-network:wafRateWindowSec: 300
+  # AWS managed rule groups (IP reputation, common rule set, known bad inputs).
+  # "count" only records what they would block, in CloudWatch metrics and
+  # sampled requests; switch to "block" once you've checked for false positives.
+  highly-secure-foundation-network:wafManagedRulesMode: count
 
   # Interface endpoints (~$8/month each per AZ). ssm, ssmmessages and
   # ec2messages give Session Manager shell access with no SSH and no bastion.
