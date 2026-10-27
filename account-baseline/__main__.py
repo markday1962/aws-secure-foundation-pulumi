@@ -5,6 +5,7 @@ import pulumi
 from src.audit_logs import AuditLogs, AuditLogsArgs
 from src.detection import Detection, DetectionArgs
 from src.hardening import Hardening, HardeningArgs
+from src.monitoring import Monitoring, MonitoringArgs
 
 config = pulumi.Config()
 aws_config = pulumi.Config("aws")
@@ -33,7 +34,23 @@ audit = AuditLogs(
 
 Detection(
     "learning-detection",
-    DetectionArgs(account_id=account_id, region=region, log_bucket=audit.bucket, log_key=audit.key),
+    DetectionArgs(
+        account_id=account_id,
+        region=region,
+        log_bucket=audit.bucket,
+        log_key=audit.key,
+        log_bucket_policy=audit.bucket_policy,
+    ),
+)
+
+monitoring = Monitoring(
+    "learning-alerts",
+    MonitoringArgs(
+        account_id=account_id,
+        key=audit.key,
+        trail_log_group=audit.trail_log_group,
+        alert_email=config.get("alertEmail"),
+    ),
 )
 
 Hardening("learning-hardening", HardeningArgs(imds_hop_limit=config.get_int("imdsHopLimit", default=1)))
@@ -41,3 +58,4 @@ Hardening("learning-hardening", HardeningArgs(imds_hop_limit=config.get_int("imd
 pulumi.export("auditBucket", audit.bucket.id)
 pulumi.export("auditKeyArn", audit.key.arn)
 pulumi.export("trailArn", audit.trail.arn)
+pulumi.export("alertTopicArn", monitoring.topic.arn)

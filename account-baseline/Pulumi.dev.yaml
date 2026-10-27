@@ -20,3 +20,7 @@ config:
   # Instance metadata (IMDSv2) hop limit. 1 is strictest; containers on EC2
   # (ECS/EKS with bridge networking) need 2.
   highly-secure-foundation-account-baseline:imdsHopLimit: 1
+
+  # Where high-severity GuardDuty and Security Hub findings and the CIS alarms
+  # are emailed. AWS sends a confirmation email first. Remove to skip email.
+  highly-secure-foundation-account-baseline:alertEmail: security-alerts@example.com
