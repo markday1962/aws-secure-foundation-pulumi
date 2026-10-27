@@ -30,6 +30,12 @@ config:
   # Set to true for anything real. Off here so `pulumi destroy` works.
   highly-secure-foundation-network:albDeletionProtection: false
 
+  # AWS WAF on the ALB. Any client IP making more than wafRateLimit requests
+  # per wafRateWindowSec seconds (60, 120, 300 or 600) gets 429 until its rate
+  # drops back under the limit.
+  highly-secure-foundation-network:wafRateLimit: 1000
+  highly-secure-foundation-network:wafRateWindowSec: 300
+
   # Interface endpoints (~$8/month each per AZ). ssm, ssmmessages and
   # ec2messages give Session Manager shell access with no SSH and no bastion.
   highly-secure-foundation-network:interfaceEndpoints:

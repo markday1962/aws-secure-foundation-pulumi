@@ -11,6 +11,7 @@ from src.cidr import subnet_cidr
 from src.load_balancer import SSL_POLICY, LoadBalancer, LoadBalancerArgs
 from src.nacls import nacl_rules
 from src.network import Network, NetworkArgs
+from src.waf import Waf, WafArgs
 
 ARGS = NetworkArgs(
     account_id="123456789012",
@@ -283,3 +284,50 @@ class TestLoadBalancer:
             "aws:s3/bucketServerSideEncryptionConfiguration:BucketServerSideEncryptionConfiguration", "lb-logs"
         )
         assert sse["rules"][0]["applyServerSideEncryptionByDefault"]["sseAlgorithm"] == "AES256"
+
+
+# ── Waf
+
+
+@pytest.fixture(scope="module")
+def waf() -> None:
+    @pulumi.runtime.test
+    def run() -> None:
+        Waf("waf", WafArgs(alb_arn="arn:aws:elasticloadbalancing:alb", rate_limit=500, rate_window_sec=120))
+
+    run()
+
+
+@pytest.mark.usefixtures("waf")
+class TestWaf:
+    def test_is_a_regional_web_acl_that_allows_by_default(self) -> None:
+        acl = registered("aws:wafv2/webAcl:WebAcl", "waf")
+        assert acl["scope"] == "REGIONAL"
+        assert acl["defaultAction"] == {"allow": {}}
+        assert acl["visibilityConfig"]["cloudwatchMetricsEnabled"] is True
+
+    def test_blocks_ips_over_the_rate_limit_with_429_and_retry_after(self) -> None:
+        acl = registered("aws:wafv2/webAcl:WebAcl", "waf")
+        (rule,) = acl["rules"]
+        assert rule["statement"]["rateBasedStatement"] == {
+            "aggregateKeyType": "IP",
+            "limit": 500,
+            "evaluationWindowSec": 120,
+        }
+        response = rule["action"]["block"]["customResponse"]
+        assert response["responseCode"] == 429
+        assert response["responseHeaders"] == [{"name": "Retry-After", "value": "120"}]
+        bodies = {b["key"] for b in acl["customResponseBodies"]}
+        assert response["customResponseBodyKey"] in bodies
+        assert rule["visibilityConfig"]["sampledRequestsEnabled"] is True
+
+    def test_protects_the_load_balancer(self) -> None:
+        assoc = registered("aws:wafv2/webAclAssociation:WebAclAssociation", "waf")
+        assert assoc == {"resourceArn": "arn:aws:elasticloadbalancing:alb", "webAclArn": "arn:aws:mock:::waf"}
+
+
+def test_rejects_rate_windows_and_limits_aws_waf_doesnt_support() -> None:
+    with pytest.raises(ValueError, match="rate_window_sec must be one of"):
+        Waf("bad-window", WafArgs(alb_arn="x", rate_limit=500, rate_window_sec=90))
+    with pytest.raises(ValueError, match="rate_limit must be between"):
+        Waf("bad-limit", WafArgs(alb_arn="x", rate_limit=5, rate_window_sec=300))
