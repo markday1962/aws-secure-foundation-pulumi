@@ -4,3 +4,6 @@ __pycache__/
 .ruff_cache/
 .pulumi/
 .DS_Store
+
+# Personal Claude Code overrides; the shared settings are .claude/settings.json.
+.claude/settings.local.json
