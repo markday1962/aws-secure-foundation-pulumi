@@ -56,3 +56,91 @@ jobs:
 
       - name: Test
         run: uv run pytest
+
+  # ── pulumi preview: switched off until the AWS sandbox account is available.
+  #
+  # Shows, on each pull request, what `pulumi up` would change in each stack,
+  # as a PR comment. It never changes anything. To switch it on:
+  #
+  #   1. In the AWS account, add GitHub as an OIDC identity provider
+  #      (token.actions.githubusercontent.com, audience sts.amazonaws.com) and a
+  #      role for this workflow to assume. Its trust policy should only accept
+  #      this repository's "preview" environment (see step 3):
+  #        "token.actions.githubusercontent.com:sub": "repo:markday1962/aws-secure-foundation-pulumi:environment:preview"
+  #      Give it read-only access (the ReadOnlyAccess managed policy), plus
+  #      read and write on the Pulumi state bucket, as Pulumi takes a lock on the
+  #      stack even for preview.
+  #   2. Move the stacks' state off `pulumi login --local`, to somewhere CI can
+  #      reach, e.g. an S3 bucket: `pulumi login s3://<bucket>?region=eu-west-1`
+  #      then `pulumi stack init dev` in each project (or migrate the existing
+  #      state with `pulumi stack export` / `pulumi stack import`).
+  #   3. In the repository's Settings → Environments, create an environment
+  #      named "preview", and add to it (not to the repository, so only this
+  #      job can read them):
+  #        variables  AWS_ACCOUNT_ID       the sandbox account ID
+  #                   AWS_ROLE_ARN         the role from step 1
+  #                   PULUMI_BACKEND_URL   e.g. s3://<bucket>?region=eu-west-1
+  #        secret     PULUMI_CONFIG_PASSPHRASE   the stacks' passphrase
+  #   4. Set the real account ID in both Pulumi.dev.yaml files, uncomment the
+  #      job below, and open a PR to see it run.
+  #   5. Optionally, add "preview (account-baseline)" and "preview (network)"
+  #      to the "Protect main" ruleset's required checks.
+  #
+  # preview:
+  #   name: preview (${{ matrix.project }})
+  #   needs: check
+  #   # Pull requests from this repository only: forks get no OIDC token or secrets.
+  #   if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+  #   runs-on: ubuntu-latest
+  #   timeout-minutes: 20
+  #   # Scopes the AWS role (its trust policy names this environment) and the
+  #   # variables and secret below to this job.
+  #   environment: preview
+  #   permissions:
+  #     contents: read # read the code
+  #     id-token: write # swap GitHub's OIDC token for short-lived AWS credentials; no stored keys
+  #     pull-requests: write # post the preview as a comment on the PR
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       project: [account-baseline, network]
+  #   # One preview per stack at a time, so runs never wait on each other's lock.
+  #   concurrency:
+  #     group: preview-${{ matrix.project }}
+  #     cancel-in-progress: false
+  #   steps:
+  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+  #       with:
+  #         persist-credentials: false
+  #
+  #     - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+  #       with:
+  #         version: "0.10.7"
+  #         python-version: "3.12"
+  #         enable-cache: true
+  #         cache-dependency-glob: ${{ matrix.project }}/uv.lock
+  #
+  #     - name: Install
+  #       working-directory: ${{ matrix.project }}
+  #       run: uv sync --locked
+  #
+  #     - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+  #       with:
+  #         role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+  #         role-session-name: preview-${{ matrix.project }}-${{ github.run_id }}
+  #         aws-region: eu-west-1
+  #         # Refuse credentials for any other account.
+  #         allowed-account-ids: ${{ vars.AWS_ACCOUNT_ID }}
+  #
+  #     - uses: pulumi/actions@8e5e406f4007fca908480587cb9893c07090f58d # v7.0.0
+  #       with:
+  #         command: preview
+  #         pulumi-version: "3.267.0"
+  #         work-dir: ${{ matrix.project }}
+  #         stack-name: dev
+  #         cloud-url: ${{ vars.PULUMI_BACKEND_URL }}
+  #         comment-on-pr: true
+  #         edit-pr-comment: true
+  #         github-token: ${{ secrets.GITHUB_TOKEN }}
+  #       env:
+  #         PULUMI_CONFIG_PASSPHRASE: ${{ secrets.PULUMI_CONFIG_PASSPHRASE }}

@@ -202,6 +202,12 @@ GitHub Actions (`.github/workflows/ci.yml`) runs the same checks on every pull
 request and every push to `main`: for each project, `uv sync --locked`, ruff
 format and lint, pyright and pytest. It never touches AWS.
 
+A `pulumi preview` job, which would comment on each PR with what `pulumi up`
+would change, is written but commented out until the AWS account is
+available. The comment above it in `ci.yml` lists what it needs: a GitHub OIDC
+role in AWS, state in S3 instead of `--local`, and a `preview` environment
+holding the variables and passphrase.
+
 ```sh
 make install                              # a .venv in each project
 make test                                 # 69 unit tests across both projects, no AWS needed
