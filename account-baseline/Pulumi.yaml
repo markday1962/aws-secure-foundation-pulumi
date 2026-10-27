@@ -1,0 +1,6 @@
+name: highly-secure-foundation-account-baseline
+description: Learning project - account-wide detection and hardening (CloudTrail, GuardDuty, Security Hub, Config)
+runtime:
+  name: python
+  options:
+    toolchain: uv

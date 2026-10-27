@@ -1,0 +1,40 @@
+[project]
+name = "highly-secure-foundation-account-baseline"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "pulumi>=3.150.0,<4",
+    "pulumi-aws>=7.0.0,<8",
+]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.400",
+    "pytest>=8.3",
+    "ruff>=0.12",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+# pulumi_aws warns about its own deprecated classes when imported.
+filterwarnings = [
+    "ignore::DeprecationWarning:pulumi_aws",
+    "ignore:There is no current event loop:DeprecationWarning",
+]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+[tool.pyright]
+include = ["__main__.py", "src", "tests"]
+exclude = [".venv"]
+typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"

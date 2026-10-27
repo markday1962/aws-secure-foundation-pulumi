@@ -1,0 +1,22 @@
+config:
+  aws:region: eu-west-1
+  # The account this stack may deploy to. Any other credentials are refused.
+  # Placeholder: replace with your sandbox account ID.
+  aws:allowedAccountIds:
+    - "111111111111"
+  aws:defaultTags:
+    tags:
+      project: aws-secure-foundation-pulumi
+      stack: account-baseline
+      environment: dev
+      managed-by: pulumi
+
+  # Audit logs (CloudTrail, Config) can't be deleted or overwritten for this
+  # many days. GOVERNANCE lets a privileged user bypass the lock (with
+  # s3:BypassGovernanceRetention); COMPLIANCE does not, not even the root user.
+  highly-secure-foundation-account-baseline:logRetentionDays: 365
+  highly-secure-foundation-account-baseline:objectLockMode: GOVERNANCE
+
+  # Instance metadata (IMDSv2) hop limit. 1 is strictest; containers on EC2
+  # (ECS/EKS with bridge networking) need 2.
+  highly-secure-foundation-account-baseline:imdsHopLimit: 1
