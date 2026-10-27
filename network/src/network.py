@@ -1,17 +1,15 @@
 from dataclasses import asdict, dataclass
-from typing import Literal
 
 import pulumi
 import pulumi_aws as aws
 
 from .address_plan import Tier, address_plan
 from .endpoints import VpcEndpoints, VpcEndpointsArgs
+from .features import Features
 from .logging import LogEncryption, LogEncryptionArgs
 from .nacls import nacl_rules
 from .policy import Statement, policy_document
 from .security_groups import TierSecurityGroups, TierSecurityGroupsArgs
-
-NatMode = Literal["single", "perAz"]
 
 
 @dataclass(frozen=True)
@@ -22,13 +20,12 @@ class NetworkArgs:
     cidr: str
     # One subnet per tier in each of these AZs (max 3).
     availability_zones: list[str]
-    nat_gateways: NatMode
+    # What to deploy beyond the VPC and its subnets. All off by default.
+    features: Features
     # Port the app tier listens on behind the load balancer (1024-65535).
     app_port: int
     # Ports the data tier listens on.
     data_ports: list[int]
-    # Interface endpoint services, e.g. "ssm". Empty to skip interface endpoints.
-    interface_endpoints: list[str]
     log_retention_days: int
 
 
@@ -41,34 +38,44 @@ class Network(pulumi.ComponentResource):
     Every layer filters independently: route tables decide what's reachable at
     all, network ACLs which tiers may talk, and security groups which resources.
     Flow logs record it all, encrypted with a customer-managed key.
+
+    Only the VPC, its subnets and route tables, and the locked-down default
+    security group and network ACL are always deployed. The rest is switched
+    on through `features` (see features.py); left off, the VPC carries no
+    traffic at all.
     """
 
     vpc: aws.ec2.Vpc
     subnets: dict[Tier, list[aws.ec2.Subnet]]
-    security_groups: TierSecurityGroups
+    # None unless features.security_groups.
+    security_groups: TierSecurityGroups | None
     nat_gateways: list[aws.ec2.NatGateway]
-    log_key: aws.kms.Key
-    # Its key and log-group factory, for other components' logs (e.g. WAF).
-    logs: LogEncryption
+    # The KMS log key and log-group factory, for this and other components'
+    # logs (e.g. WAF). None unless something needs it.
+    logs: LogEncryption | None
 
     def __init__(self, name: str, args: NetworkArgs, opts: pulumi.ResourceOptions | None = None):
         super().__init__("learning:network:Network", name, {}, opts)
 
         plan = address_plan(args.cidr, len(args.availability_zones))
-        nacls = nacl_rules(plan, args.app_port, args.data_ports)
+        features = args.features
         azs = args.availability_zones
         child_opts = pulumi.ResourceOptions(parent=self)
 
         def tag(suffix: str) -> dict[str, str]:
             return {"Name": f"{name}-{suffix}"}
 
-        logs = LogEncryption(
-            f"{name}-logs",
-            LogEncryptionArgs(account_id=args.account_id, region=args.region, retention_days=args.log_retention_days),
-            opts=child_opts,
+        self.logs = (
+            LogEncryption(
+                f"{name}-logs",
+                LogEncryptionArgs(
+                    account_id=args.account_id, region=args.region, retention_days=args.log_retention_days
+                ),
+                opts=child_opts,
+            )
+            if features.log_encryption
+            else None
         )
-        self.logs = logs
-        self.log_key = logs.key
 
         self.vpc = aws.ec2.Vpc(
             name,
@@ -101,7 +108,11 @@ class Network(pulumi.ComponentResource):
         }
 
         # ── Ingress: the Internet Gateway.
-        igw = aws.ec2.InternetGateway(name, vpc_id=self.vpc.id, tags=tag("igw"), opts=child_opts)
+        igw = (
+            aws.ec2.InternetGateway(name, vpc_id=self.vpc.id, tags=tag("igw"), opts=child_opts)
+            if features.internet_gateway
+            else None
+        )
 
         def route_table(table_id: str) -> aws.ec2.RouteTable:
             return aws.ec2.RouteTable(f"{name}-{table_id}", vpc_id=self.vpc.id, tags=tag(table_id), opts=child_opts)
@@ -111,20 +122,21 @@ class Network(pulumi.ComponentResource):
                 f"{name}-{assoc_id}", subnet_id=subnet.id, route_table_id=table.id, opts=child_opts
             )
 
-        # Public subnets: straight out through the Internet Gateway.
+        # Public subnets: straight out through the Internet Gateway, if there is one.
         public_table = route_table("public")
-        aws.ec2.Route(
-            f"{name}-public-internet",
-            route_table_id=public_table.id,
-            destination_cidr_block="0.0.0.0/0",
-            gateway_id=igw.id,
-            opts=child_opts,
-        )
+        if igw:
+            aws.ec2.Route(
+                f"{name}-public-internet",
+                route_table_id=public_table.id,
+                destination_cidr_block="0.0.0.0/0",
+                gateway_id=igw.id,
+                opts=child_opts,
+            )
         for i, az in enumerate(azs):
             associate(f"public-{az}", self.subnets["public"][i], public_table)
 
         # ── Egress: NAT gateways in the public subnets.
-        nat_azs = azs if args.nat_gateways == "perAz" else azs[:1]
+        nat_azs = {"none": [], "single": azs[:1], "perAz": azs}[features.nat_gateways]
         self.nat_gateways = []
         for az in nat_azs:
             eip = aws.ec2.Eip(f"{name}-nat-{az}", domain="vpc", tags=tag(f"nat-{az}"), opts=child_opts)
@@ -134,23 +146,24 @@ class Network(pulumi.ComponentResource):
                     allocation_id=eip.id,
                     subnet_id=self.subnets["public"][azs.index(az)].id,
                     tags=tag(f"nat-{az}"),
-                    opts=pulumi.ResourceOptions(parent=self, depends_on=[igw]),
+                    opts=pulumi.ResourceOptions(parent=self, depends_on=[igw] if igw else []),
                 )
             )
 
-        # App subnets: internet traffic via NAT. One table per AZ
-        # so each can use its own NAT.
+        # App subnets: internet traffic via NAT, if there is one. One table per
+        # AZ so each can use its own NAT.
         app_tables: list[aws.ec2.RouteTable] = []
         for i, az in enumerate(azs):
             table = route_table(f"app-{az}")
-            nat = self.nat_gateways[i if args.nat_gateways == "perAz" else 0]
-            aws.ec2.Route(
-                f"{name}-app-{az}-egress",
-                route_table_id=table.id,
-                destination_cidr_block="0.0.0.0/0",
-                nat_gateway_id=nat.id,
-                opts=child_opts,
-            )
+            if self.nat_gateways:
+                nat = self.nat_gateways[i if features.nat_gateways == "perAz" else 0]
+                aws.ec2.Route(
+                    f"{name}-app-{az}-egress",
+                    route_table_id=table.id,
+                    destination_cidr_block="0.0.0.0/0",
+                    nat_gateway_id=nat.id,
+                    opts=child_opts,
+                )
             associate(f"app-{az}", self.subnets["app"][i], table)
             app_tables.append(table)
 
@@ -159,17 +172,20 @@ class Network(pulumi.ComponentResource):
         for i, az in enumerate(azs):
             associate(f"data-{az}", self.subnets["data"][i], data_table)
 
-        # ── Network ACLs per tier, and the default ACL stripped of its allow-all rules.
-        for tier, nacl in nacls.items():
-            aws.ec2.NetworkAcl(
-                f"{name}-{tier}",
-                vpc_id=self.vpc.id,
-                subnet_ids=[s.id for s in self.subnets[tier]],
-                ingress=[aws.ec2.NetworkAclIngressArgs(**asdict(r)) for r in nacl.ingress],
-                egress=[aws.ec2.NetworkAclEgressArgs(**asdict(r)) for r in nacl.egress],
-                tags=tag(f"{tier}-nacl"),
-                opts=child_opts,
-            )
+        # ── Network ACLs per tier, and the default ACL stripped of its allow-all
+        # rules. Without the tier ACLs, every subnet falls back to the default
+        # ACL, so the VPC carries no traffic.
+        if features.network_acls:
+            for tier, nacl in nacl_rules(plan, args.app_port, args.data_ports).items():
+                aws.ec2.NetworkAcl(
+                    f"{name}-{tier}",
+                    vpc_id=self.vpc.id,
+                    subnet_ids=[s.id for s in self.subnets[tier]],
+                    ingress=[aws.ec2.NetworkAclIngressArgs(**asdict(r)) for r in nacl.ingress],
+                    egress=[aws.ec2.NetworkAclEgressArgs(**asdict(r)) for r in nacl.egress],
+                    tags=tag(f"{tier}-nacl"),
+                    opts=child_opts,
+                )
         aws.ec2.DefaultNetworkAcl(
             name,
             default_network_acl_id=self.vpc.default_network_acl_id,
@@ -184,29 +200,35 @@ class Network(pulumi.ComponentResource):
         )
 
         # ── Security groups per tier, chained by reference.
-        self.security_groups = TierSecurityGroups(
-            f"{name}-sg",
-            TierSecurityGroupsArgs(vpc_id=self.vpc.id, app_port=args.app_port, data_ports=args.data_ports),
-            opts=child_opts,
+        self.security_groups = (
+            TierSecurityGroups(
+                f"{name}-sg",
+                TierSecurityGroupsArgs(vpc_id=self.vpc.id, app_port=args.app_port, data_ports=args.data_ports),
+                opts=child_opts,
+            )
+            if features.security_groups
+            else None
         )
 
         # ── Private access to AWS APIs.
-        VpcEndpoints(
-            f"{name}-vpce",
-            VpcEndpointsArgs(
-                vpc_id=self.vpc.id,
-                region=args.region,
-                account_id=args.account_id,
-                gateway_route_table_ids=[t.id for t in app_tables],
-                interface_services=args.interface_endpoints,
-                interface_subnet_ids=[s.id for s in self.subnets["app"]],
-                security_group_id=self.security_groups.endpoints.id,
-            ),
-            opts=child_opts,
-        )
+        if features.gateway_endpoints or features.interface_endpoints:
+            VpcEndpoints(
+                f"{name}-vpce",
+                VpcEndpointsArgs(
+                    vpc_id=self.vpc.id,
+                    region=args.region,
+                    account_id=args.account_id,
+                    gateway_route_table_ids=[t.id for t in app_tables] if features.gateway_endpoints else [],
+                    interface_services=features.interface_endpoints,
+                    interface_subnet_ids=[s.id for s in self.subnets["app"]],
+                    security_group_id=self.security_groups.endpoints.id if self.security_groups else None,
+                ),
+                opts=child_opts,
+            )
 
         # ── VPC Flow Logs: every accepted and rejected flow, at one-minute granularity.
-        self._flow_logs(name, args, logs)
+        if features.flow_logs and self.logs:
+            self._flow_logs(name, args, self.logs)
 
         self.register_outputs({"vpcId": self.vpc.id})
 

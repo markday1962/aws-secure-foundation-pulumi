@@ -11,16 +11,47 @@ config:
       environment: dev
       managed-by: pulumi
 
+  # ── Always deployed: the VPC, its subnets and route tables, and the
+  # locked-down default security group and network ACL.
   highly-secure-foundation-network:vpcCidr: 10.0.0.0/16
   highly-secure-foundation-network:availabilityZones:
     - eu-west-1a
     - eu-west-1b
     - eu-west-1c
-  # "single" = one NAT shared by all AZs. "perAz" = one per AZ (survives an AZ outage).
-  highly-secure-foundation-network:natGateways: perAz
+
+  # ── Everything else is off. Switch features on one `pulumi up` at a time,
+  # roughly in this order; the stack refuses a feature whose dependencies are
+  # off. Until networkAcls is on, every subnet uses the deny-all default ACL.
+  #
+  #   1. networkAcls, securityGroups, flowLogs     free (flow logs: log volume)
+  #   2. internetGateway, gatewayEndpoints         free
+  #   3. natGateways                               ~$35/month each
+  #   4. interfaceEndpoints                        ~$8/month each per AZ
+  #   5. loadBalancer                              ~$18/month + LCUs
+  #   6. waf                                       ~$20/month + per request
+  highly-secure-foundation-network:networkAcls: false
+  highly-secure-foundation-network:securityGroups: false
+  highly-secure-foundation-network:flowLogs: false
+  highly-secure-foundation-network:internetGateway: false
+  highly-secure-foundation-network:gatewayEndpoints: false
+  # "none", "single" (one NAT shared by all AZs) or "perAz" (one per AZ, survives
+  # an AZ outage). Needs internetGateway and networkAcls.
+  highly-secure-foundation-network:natGateways: none
+  # Interface endpoint services. Needs networkAcls and securityGroups. ssm,
+  # ssmmessages and ec2messages give Session Manager shell access with no SSH
+  # and no bastion. The full set, to switch on:
+  #   [ssm, ssmmessages, ec2messages, sts, kms, logs, secretsmanager, ecr.api, ecr.dkr, sqs]
+  highly-secure-foundation-network:interfaceEndpoints: []
+  # Needs internetGateway, networkAcls and securityGroups.
+  highly-secure-foundation-network:loadBalancer: false
+  # Needs loadBalancer.
+  highly-secure-foundation-network:waf: false
+
+  # ── Settings, used once the features that need them are on.
   highly-secure-foundation-network:appPort: 8443
   highly-secure-foundation-network:dataPorts:
     - 5432
+  highly-secure-foundation-network:logRetentionDays: 365
 
   # The internet-facing ALB. domainName must be in the Route 53 public hosted
   # zone hostedZoneName; the stack adds the ACM validation record and an alias
@@ -42,19 +73,3 @@ config:
   # AWS Bot Control (paid: $10/month plus $1 per million requests at "common",
   # $10 per million at "targeted"). It follows wafManagedRulesMode. "off" to skip.
   highly-secure-foundation-network:wafBotControl: common
-
-  # Interface endpoints (~$8/month each per AZ). ssm, ssmmessages and
-  # ec2messages give Session Manager shell access with no SSH and no bastion.
-  highly-secure-foundation-network:interfaceEndpoints:
-    - ssm
-    - ssmmessages
-    - ec2messages
-    - sts
-    - kms
-    - logs
-    - secretsmanager
-    - ecr.api
-    - ecr.dkr
-    - sqs
-
-  highly-secure-foundation-network:logRetentionDays: 365
