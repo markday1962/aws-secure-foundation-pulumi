@@ -1,3 +1,4 @@
+import re
 from dataclasses import dataclass
 from typing import Literal
 
@@ -76,6 +77,15 @@ def managed_statement(group: ManagedRuleGroup) -> aws.wafv2.WebAclRuleStatementM
     return statement
 
 
+# ISO 3166-1 alpha-2 codes: the United Kingdom and the 27 EU member states
+# (Greece is GR here, not the EU's own EL).
+UK_AND_EU = [
+    "GB",
+    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE",
+    "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE",
+]  # fmt: skip
+
+
 # Headers never written to the WAF logs: they carry credentials and session tokens.
 REDACTED_HEADERS = ["authorization", "cookie"]
 
@@ -95,6 +105,9 @@ class WafArgs:
     managed_rules_mode: ManagedRulesMode
     # Bot Control's inspection level, or "off" to leave the paid group out.
     bot_control: BotControlLevel
+    # Countries requests may come from (ISO 3166-1 alpha-2, e.g. "GB"). Any
+    # other country is blocked with 403. Empty to allow every country.
+    allowed_countries: list[str]
     # Encrypts the WAF log group and sets its retention.
     logs: LogEncryption
 
@@ -104,6 +117,9 @@ class Waf(pulumi.ComponentResource):
     AWS WAF in front of the ALB (SEC05-BP03, SEC06). The web ACL allows by
     default; its rules match in priority order:
 
+       5  geo allow-list (optional)       requests from any other country get
+                                          403; checked first, so they cost no
+                                          further inspection
       10  AWS IP reputation list          managed: count or block
       20  rate limit                      any client IP over `rate_limit` requests
                                           per window gets 429 Too Many Requests
@@ -129,6 +145,9 @@ class Waf(pulumi.ComponentResource):
             raise ValueError(f"rate_limit must be between 10 and 2,000,000,000, got {args.rate_limit}")
         if args.managed_rules_mode not in ("count", "block"):
             raise ValueError(f'managed_rules_mode must be "count" or "block", got "{args.managed_rules_mode}"')
+        bad_codes = [c for c in args.allowed_countries if not re.fullmatch(r"[A-Z]{2}", c)]
+        if bad_codes:
+            raise ValueError(f"allowed_countries must be ISO 3166-1 alpha-2 codes such as GB, got {bad_codes}")
         if args.bot_control not in BOT_CONTROL_LEVELS:
             raise ValueError(f'bot_control must be one of {BOT_CONTROL_LEVELS}, got "{args.bot_control}"')
 
@@ -151,6 +170,28 @@ class Waf(pulumi.ComponentResource):
             for group in groups
         ]
 
+        # Blocks every country not on the allow-list. Based on the client's
+        # source IP, which the ALB sees directly (no CDN or proxy in front).
+        geo_rules: list[aws.wafv2.WebAclRuleArgsDict] = (
+            [
+                {
+                    "name": "geo-allow-list",
+                    "priority": 5,
+                    "action": {
+                        "block": {"custom_response": {"response_code": 403, "custom_response_body_key": "geo-blocked"}}
+                    },
+                    "statement": {
+                        "not_statement": {
+                            "statement": {"geo_match_statement": {"country_codes": sorted(set(args.allowed_countries))}}
+                        }
+                    },
+                    "visibility_config": visibility(f"{name}-geo-allow-list"),
+                }
+            ]
+            if args.allowed_countries
+            else []
+        )
+
         self.web_acl = aws.wafv2.WebAcl(
             name,
             name=name,
@@ -163,9 +204,15 @@ class Waf(pulumi.ComponentResource):
                     "key": "rate-limited",
                     "content_type": "TEXT_PLAIN",
                     "content": "Too many requests. Slow down and try again shortly.\n",
-                }
+                },
+                {
+                    "key": "geo-blocked",
+                    "content_type": "TEXT_PLAIN",
+                    "content": "This service isn't available in your region.\n",
+                },
             ],
             rules=[
+                *geo_rules,
                 {
                     "name": "rate-limit-per-ip",
                     "priority": 20,

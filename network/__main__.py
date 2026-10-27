@@ -6,7 +6,7 @@ import pulumi
 from src.features import Features
 from src.load_balancer import LoadBalancer, LoadBalancerArgs
 from src.network import Network, NetworkArgs
-from src.waf import Waf, WafArgs
+from src.waf import UK_AND_EU, Waf, WafArgs
 
 config = pulumi.Config()
 aws_config = pulumi.Config("aws")
@@ -129,6 +129,7 @@ if features.vpc:
                     rate_window_sec=config.get_int("wafRateWindowSec", default=300),
                     managed_rules_mode=waf_managed_rules_mode,
                     bot_control=waf_bot_control,
+                    allowed_countries=config.get_object("wafAllowedCountries", default=UK_AND_EU),
                     logs=network.logs,
                 ),
             )
