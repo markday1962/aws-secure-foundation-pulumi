@@ -4,6 +4,9 @@ from typing import Literal
 import pulumi
 import pulumi_aws as aws
 
+from .logging import LogEncryption
+from .policy import Statement, policy_document
+
 # The evaluation windows AWS WAF supports for rate-based rules, in seconds.
 RATE_WINDOWS = (60, 120, 300, 600)
 
@@ -33,8 +36,14 @@ MANAGED_RULE_GROUPS = [
 ]
 
 
+# Headers never written to the WAF logs: they carry credentials and session tokens.
+REDACTED_HEADERS = ["authorization", "cookie"]
+
+
 @dataclass(frozen=True)
 class WafArgs:
+    account_id: str
+    region: str
     # The load balancer the web ACL protects.
     alb_arn: pulumi.Input[str]
     # Requests one client IP may make per window before it's blocked.
@@ -44,6 +53,8 @@ class WafArgs:
     # Whether the managed rule groups only count matches or block them. Start
     # with "count", check what they'd block, then switch to "block".
     managed_rules_mode: ManagedRulesMode
+    # Encrypts the WAF log group and sets its retention.
+    logs: LogEncryption
 
 
 class Waf(pulumi.ComponentResource):
@@ -59,7 +70,9 @@ class Waf(pulumi.ComponentResource):
       40  AWS known bad inputs            managed: count or block
 
     Every rule publishes CloudWatch metrics and keeps sampled requests, so you
-    can see what a rule matches before relying on it.
+    can see what a rule matches before relying on it. Every request is also
+    logged in full to a KMS-encrypted CloudWatch log group, with credentials
+    and cookies redacted: in count mode, that's where false positives show up.
     """
 
     web_acl: aws.wafv2.WebAcl
@@ -136,4 +149,41 @@ class Waf(pulumi.ComponentResource):
 
         aws.wafv2.WebAclAssociation(name, resource_arn=args.alb_arn, web_acl_arn=self.web_acl.arn, opts=child_opts)
 
+        self._logging(name, args)
+
         self.register_outputs({"webAclArn": self.web_acl.arn})
+
+    def _logging(self, name: str, args: WafArgs) -> None:
+        child_opts = pulumi.ResourceOptions(parent=self)
+        # WAF only logs to log groups whose names start with "aws-waf-logs-".
+        log_group = args.logs.log_group(f"{name}-logs", f"aws-waf-logs-{name}")
+
+        # WAF delivers through CloudWatch Logs' log delivery service. Without
+        # this policy WAF tries to add a broader one of its own.
+        log_policy = aws.cloudwatch.LogResourcePolicy(
+            f"{name}-logs",
+            policy_name=f"{name}-waf-log-delivery",
+            policy_document=policy_document(
+                [
+                    Statement(
+                        sid="WafLogDelivery",
+                        principals={"type": "Service", "identifiers": ["delivery.logs.amazonaws.com"]},
+                        actions=["logs:CreateLogStream", "logs:PutLogEvents"],
+                        resources=[pulumi.Output.concat(log_group.arn, ":log-stream:*")],
+                        conditions={
+                            "StringEquals": {"aws:SourceAccount": args.account_id},
+                            "ArnLike": {"aws:SourceArn": f"arn:aws:logs:{args.region}:{args.account_id}:*"},
+                        },
+                    )
+                ]
+            ),
+            opts=child_opts,
+        )
+
+        aws.wafv2.WebAclLoggingConfiguration(
+            name,
+            resource_arn=self.web_acl.arn,
+            log_destination_configs=[log_group.arn],
+            redacted_fields=[{"single_header": {"name": header}} for header in REDACTED_HEADERS],
+            opts=pulumi.ResourceOptions(parent=self, depends_on=[log_policy]),
+        )

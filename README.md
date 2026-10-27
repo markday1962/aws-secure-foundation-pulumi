@@ -50,7 +50,7 @@ switch off your CloudTrail or GuardDuty.
  │ 10.0.100.0/22…                                                             │
  │                                                                            │
  │ default SG + default NACL deny all                                         │
- │ VPC flow logs → CloudWatch (KMS, 365 days) · ALB access logs → S3          │
+ │ flow logs + WAF logs → CloudWatch (KMS, 365 days) · ALB access logs → S3   │
  └────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -74,6 +74,20 @@ let it through. Watch them under real traffic, add exclusions for any false
 positives (the common rule set's `SizeRestrictions_BODY`, which matches bodies
 over 8 KB, is the usual one), then set `wafManagedRulesMode: block`.
 
+**WAF logs:** every request the web ACL sees is logged in full to the
+CloudWatch log group `aws-waf-logs-learning-<stack>-waf`, encrypted with the
+network's KMS key and kept for `logRetentionDays`. The `authorization` and
+`cookie` headers are redacted. To see what the count-mode groups would have
+blocked, run this in CloudWatch Logs Insights:
+
+```
+fields @timestamp, httpRequest.clientIp, httpRequest.httpMethod, httpRequest.uri
+| filter @message like /"action":"COUNT"/
+| sort @timestamp desc
+```
+
+Each matching record's `ruleGroupList` names the group and rule that matched.
+
 Port 80 only ever answers with a 301 to
 HTTPS. Port 443 terminates TLS with `ELBSecurityPolicy-TLS13-1-2-Res-2021-06`,
 adds HSTS, `nosniff` and `X-Frame-Options: DENY`, drops malformed headers, and
@@ -96,7 +110,7 @@ group and NACL limit it to port 443, and nothing more.
 | **SEC05-BP04** Automate network protection | All of it is code, with unit tests that check the rules. |
 | **SEC09** Protect data in transit | HTTP→HTTPS redirect, TLS 1.2/1.3 only, HSTS, TLS to the targets; buckets deny non-TLS requests. |
 | Lock down defaults (CIS 5.4) | Default security group and default network ACL both stripped of every rule. |
-| **SEC04-BP01/02** Logging in standard places | VPC flow logs (all traffic, 1-minute, v5 fields), ALB access logs, CloudTrail (S3 and CloudWatch Logs), S3 server access logs on the audit bucket, AWS Config. |
+| **SEC04-BP01/02** Logging in standard places | VPC flow logs (all traffic, 1-minute, v5 fields), ALB access logs, WAF logs (every request, credentials redacted), CloudTrail (S3 and CloudWatch Logs), S3 server access logs on the audit bucket, AWS Config. |
 | **SEC04** Detect unexpected behaviour | GuardDuty (with S3, EKS, EBS malware, RDS, Lambda and runtime monitoring), Security Hub (FSBP + CIS 5.0.0), IAM Access Analyzer, the 14 CIS CloudTrail metric-filter alarms. |
 | **SEC04-BP03 / SEC10** Alert and respond | High-severity GuardDuty findings, new HIGH/CRITICAL Security Hub findings and the CIS alarms go to an encrypted SNS topic (optional email). |
 | Protect data at rest | Customer-managed KMS keys with rotation for logs and alerts; EBS encryption by default; audit logs in an Object Lock bucket. |
@@ -131,7 +145,7 @@ Needs Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
 ```sh
 make install                              # a .venv in each project
-make test                                 # 44 unit tests across both projects, no AWS needed
+make test                                 # 46 unit tests across both projects, no AWS needed
 make lint                                 # ruff and pyright
 
 pulumi login --local                      # local state while learning
@@ -155,6 +169,7 @@ for i in $(seq 1 1200); do curl -s -o /dev/null -w "%{http_code}\n" https://app.
 | NAT gateways, 1 per AZ × 3 | ~$105 + $0.048/GB |
 | Application Load Balancer | ~$18 + LCUs |
 | AWS WAF, 1 web ACL + 4 rules | ~$9 + $0.60 per million requests |
+| WAF logs in CloudWatch | ~$0.57/GB ingested (roughly 1–2 GB per million requests) |
 | Public IPv4 addresses (NAT EIPs, ALB) | ~$20 |
 | GuardDuty, Security Hub, Config | usage-based; usually tens of dollars in a quiet account |
 | KMS keys (2), logs, alarms (14), Route 53 zone | a few dollars |
@@ -183,8 +198,9 @@ cuts every AZ's internet access) or trim `interfaceEndpoints` in
 
 ## What's deliberately not here
 
-- **More WAF**: WAF logging, geo rules, and the paid managed groups (Bot
-  Control, Account Takeover Prevention) are still to come.
+- **More WAF**: geo rules, and the paid managed groups (Bot Control, Account
+  Takeover Prevention), are still to come. A logging filter (keep only
+  blocked and counted requests) would cut log costs on a busy site.
 - **Egress filtering by destination**: Network Firewall and DNS Firewall were
   removed. To bring domain filtering back cheaply, re-add a Route 53 DNS
   Firewall allow-list.

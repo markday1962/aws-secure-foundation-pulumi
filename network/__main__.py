@@ -85,10 +85,13 @@ if waf_managed_rules_mode not in ("count", "block"):
 waf = Waf(
     f"{prefix}-waf",
     WafArgs(
+        account_id=account_id,
+        region=region,
         alb_arn=alb.alb.arn,
         rate_limit=config.get_int("wafRateLimit", default=1000),
         rate_window_sec=config.get_int("wafRateWindowSec", default=300),
         managed_rules_mode=waf_managed_rules_mode,
+        logs=network.logs,
     ),
 )
 

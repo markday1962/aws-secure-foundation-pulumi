@@ -16,8 +16,8 @@ class LogEncryptionArgs:
 
 class LogEncryption(pulumi.ComponentResource):
     """
-    A customer-managed KMS key for this VPC's logs (flow logs, and later
-    load balancer and WAF logs), and a factory for log groups encrypted with it.
+    A customer-managed KMS key for this VPC's logs (flow logs and WAF
+    logs), and a factory for log groups encrypted with it.
     """
 
     key: aws.kms.Key

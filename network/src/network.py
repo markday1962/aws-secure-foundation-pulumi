@@ -48,6 +48,8 @@ class Network(pulumi.ComponentResource):
     security_groups: TierSecurityGroups
     nat_gateways: list[aws.ec2.NatGateway]
     log_key: aws.kms.Key
+    # Its key and log-group factory, for other components' logs (e.g. WAF).
+    logs: LogEncryption
 
     def __init__(self, name: str, args: NetworkArgs, opts: pulumi.ResourceOptions | None = None):
         super().__init__("learning:network:Network", name, {}, opts)
@@ -65,6 +67,7 @@ class Network(pulumi.ComponentResource):
             LogEncryptionArgs(account_id=args.account_id, region=args.region, retention_days=args.log_retention_days),
             opts=child_opts,
         )
+        self.logs = logs
         self.log_key = logs.key
 
         self.vpc = aws.ec2.Vpc(
