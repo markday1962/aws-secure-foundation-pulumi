@@ -1,5 +1,5 @@
 name: highly-secure-foundation-account-baseline
-description: Learning project - account-wide detection and hardening (CloudTrail, GuardDuty, Security Hub, Config)
+description: Learning project - account-wide detection and hardening (CloudTrail, GuardDuty, Security Hub, Config, alerts)
 runtime:
   name: python
   options:

@@ -1,5 +1,5 @@
 name: highly-secure-foundation-network
-description: Learning project - a hardened four-tier VPC following the Well-Architected security pillar
+description: Learning project - a hardened three-tier VPC behind an Application Load Balancer, following the Well-Architected security pillar
 runtime:
   name: python
   options:
