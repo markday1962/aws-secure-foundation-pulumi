@@ -143,14 +143,42 @@ group and NACL limit it to port 443, and nothing more.
 3. **Set `alertEmail`** in `account-baseline/Pulumi.dev.yaml`, and confirm the
    subscription email AWS sends. Expect a burst of CIS alarms (security group,
    NACL, route table, VPC changes) while the network stack deploys.
-4. **Set `domainName` and `hostedZoneName`** in `network/Pulumi.dev.yaml`.
-   The hosted zone must be a public Route 53 zone in this account that holds
-   `domainName`; the stack adds the ACM validation record and an alias record
-   to the ALB. The first `pulumi up` waits for the certificate to validate
-   (usually a few minutes).
+4. **Before switching on `loadBalancer`, set `domainName` and
+   `hostedZoneName`** in `network/Pulumi.dev.yaml`. The hosted zone must be a
+   public Route 53 zone in this account that holds `domainName`; the stack
+   adds the ACM validation record and an alias record to the ALB. That
+   `pulumi up` waits for the certificate to validate (usually a few minutes).
 5. **Stack names are at most 10 characters** (lowercase, digits, hyphens).
    Every physical name starts with `learning-<stack>`, so several stacks can
    share an account, and the ALB's name must fit in 32 characters.
+
+## Controlled deployment
+
+The network stack deploys almost nothing by default. Only the VPC, its nine
+subnets and their route tables are always there, plus the default security
+group and default network ACL with every rule removed. That VPC carries no
+traffic at all, and costs nothing.
+
+Everything else is a feature flag in `network/Pulumi.dev.yaml`, off until you
+switch it on. Bring the network up one `pulumi up` at a time, checking
+`pulumi preview` before each:
+
+| Step | Flag | Needs | Adds | Cost |
+|---|---|---|---|---|
+| 1 | `networkAcls: true` | | a network ACL per tier; until then every subnet uses the deny-all default ACL | free |
+| 1 | `securityGroups: true` | | the ALB, app, data and endpoint security groups | free |
+| 1 | `flowLogs: true` | | VPC flow logs, the KMS log key | log volume |
+| 2 | `internetGateway: true` | | the Internet Gateway and the public subnets' route to it | free |
+| 2 | `gatewayEndpoints: true` | `networkAcls` | S3 and DynamoDB gateway endpoints | free |
+| 3 | `natGateways: single` or `perAz` | `internetGateway`, `networkAcls` | NAT gateways and the app tier's route out | ~$35 each |
+| 4 | `interfaceEndpoints: [ssm, …]` | `networkAcls`, `securityGroups` | interface endpoints | ~$8 each per AZ |
+| 5 | `loadBalancer: true` | `internetGateway`, `networkAcls`, `securityGroups` | the ALB, its certificate, DNS record and log bucket | ~$18 + LCUs |
+| 6 | `waf: true` | `loadBalancer` | the WAF web ACL and its logs (and the KMS log key) | ~$20 + per request |
+
+The stack refuses to run if a flag is on without what it needs, for example
+`waf needs load_balancer switched on too`. Turning a flag back off removes
+what it added on the next `pulumi up`. The exported `features` output shows
+what a stack has switched on.
 
 ## Running it
 
@@ -162,15 +190,16 @@ format and lint, pyright and pytest. It never touches AWS.
 
 ```sh
 make install                              # a .venv in each project
-make test                                 # 47 unit tests across both projects, no AWS needed
+make test                                 # 58 unit tests across both projects, no AWS needed
 make lint                                 # ruff and pyright
 
 pulumi login --local                      # local state while learning
 export AWS_PROFILE=<sandbox profile>
 
 cd account-baseline && pulumi stack init dev && pulumi up
-cd ../network       && pulumi stack init dev && pulumi up
+cd ../network       && pulumi stack init dev && pulumi up      # the VPC and subnets only
 
+# Then switch features on step by step (see above). Once loadBalancer and waf are on:
 curl -I http://app.example.com            # 301, Location: https://app.example.com:443/
 curl https://app.example.com              # ok
 
@@ -179,6 +208,8 @@ for i in $(seq 1 1200); do curl -s -o /dev/null -w "%{http_code}\n" https://app.
 ```
 
 ## Cost (eu-west-1, approximate)
+
+With every feature on:
 
 | Item | Monthly |
 |---|---|
@@ -193,7 +224,8 @@ for i in $(seq 1 1200); do curl -s -o /dev/null -w "%{http_code}\n" https://app.
 | KMS keys (2), logs, alarms (14), Route 53 zone | a few dollars |
 | **Total** | **~$410+** |
 
-To cut costs, set `natGateways: single` (saves ~$70, but an outage in that AZ
+With every network feature off, the network stack costs nothing. To cut costs
+with them on, set `natGateways: single` (saves ~$70, but an outage in that AZ
 cuts every AZ's internet access) or trim `interfaceEndpoints` in
 `network/Pulumi.dev.yaml`.
 

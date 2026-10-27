@@ -8,21 +8,32 @@ from conftest import AZS, MOCKS, all_of, registered
 
 from src.address_plan import address_plan
 from src.cidr import subnet_cidr
+from src.features import Features
 from src.load_balancer import SSL_POLICY, LoadBalancer, LoadBalancerArgs
 from src.logging import LogEncryption, LogEncryptionArgs
 from src.nacls import nacl_rules
 from src.network import Network, NetworkArgs
 from src.waf import MANAGED_RULE_GROUPS, Waf, WafArgs
 
+# Everything Network deploys, switched on.
+FULL = Features(
+    internet_gateway=True,
+    nat_gateways="perAz",
+    network_acls=True,
+    security_groups=True,
+    gateway_endpoints=True,
+    interface_endpoints=["ssm", "ssmmessages", "sts"],
+    flow_logs=True,
+)
+
 ARGS = NetworkArgs(
     account_id="123456789012",
     region="eu-west-1",
     cidr="10.0.0.0/16",
     availability_zones=AZS,
-    nat_gateways="perAz",
+    features=FULL,
     app_port=8443,
     data_ports=[5432],
-    interface_endpoints=["ssm", "ssmmessages", "sts"],
     log_retention_days=365,
 )
 
@@ -146,7 +157,7 @@ class TestNetwork:
             assert route["natGatewayId"] == f"t-{az}_id"
 
     def test_shares_one_nat_gateway_across_azs_when_nat_gateways_is_single(self) -> None:
-        build("onenat", replace(ARGS, nat_gateways="single"))
+        build("onenat", replace(ARGS, features=replace(FULL, nat_gateways="single")))
         route = registered("aws:ec2/route:Route", "onenat-app-eu-west-1c-egress")
         assert route["natGatewayId"] == "onenat-eu-west-1a_id"
         nats = [r for r in all_of("aws:ec2/natGateway:NatGateway") if r.name.startswith("onenat-")]
@@ -202,6 +213,74 @@ class TestNetwork:
             (80, 80, "0.0.0.0/0"),
             (443, 443, "0.0.0.0/0"),
         ]
+
+
+# ── Features: a controlled, step-by-step deployment
+
+
+def types_for(name: str) -> set[str]:
+    """The resource types registered by the Network named `name`."""
+    return {r.typ for r in MOCKS.created if r.name == name or r.name.startswith(f"{name}-")}
+
+
+CORE = {
+    "learning:network:Network",
+    "aws:ec2/vpc:Vpc",
+    "aws:ec2/subnet:Subnet",
+    "aws:ec2/routeTable:RouteTable",
+    "aws:ec2/routeTableAssociation:RouteTableAssociation",
+    "aws:ec2/defaultNetworkAcl:DefaultNetworkAcl",
+    "aws:ec2/defaultSecurityGroup:DefaultSecurityGroup",
+}
+
+
+def test_deploys_only_the_vpc_and_its_subnets_by_default() -> None:
+    build("core", replace(ARGS, features=Features()))
+    assert types_for("core") == CORE
+    subnets = [r for r in all_of("aws:ec2/subnet:Subnet") if r.name.startswith("core-")]
+    assert len(subnets) == 9  # three tiers in three AZs
+    routes = [r for r in all_of("aws:ec2/route:Route") if r.name.startswith("core-")]
+    assert routes == []
+
+
+def test_adds_only_the_internet_gateway_and_its_route_when_that_alone_is_switched_on() -> None:
+    build("igw", replace(ARGS, features=Features(internet_gateway=True)))
+    assert types_for("igw") == CORE | {"aws:ec2/internetGateway:InternetGateway", "aws:ec2/route:Route"}
+    registered("aws:ec2/route:Route", "igw-public-internet")
+
+
+def test_creates_the_log_key_only_when_something_logs() -> None:
+    build("fl", replace(ARGS, features=Features(flow_logs=True)))
+    registered("aws:kms/key:Key", "fl-logs")
+    registered("aws:ec2/flowLog:FlowLog", "fl")
+    assert Features(flow_logs=True).log_encryption
+    assert Features(
+        internet_gateway=True, network_acls=True, security_groups=True, load_balancer=True, waf=True
+    ).log_encryption
+    assert not Features().log_encryption
+
+
+def test_creates_gateway_endpoints_without_interface_endpoints() -> None:
+    build("gw", replace(ARGS, features=Features(network_acls=True, gateway_endpoints=True)))
+    endpoints = sorted(r.name for r in all_of("aws:ec2/vpcEndpoint:VpcEndpoint") if r.name.startswith("gw-"))
+    assert endpoints == ["gw-vpce-dynamodb", "gw-vpce-s3"]
+
+
+@pytest.mark.parametrize(
+    ("features", "message"),
+    [
+        ({"nat_gateways": "single"}, "nat_gateways needs internet_gateway and network_acls"),
+        ({"nat_gateways": "perAz", "internet_gateway": True}, "nat_gateways needs network_acls"),
+        ({"gateway_endpoints": True}, "gateway_endpoints needs network_acls"),
+        ({"interface_endpoints": ["ssm"], "network_acls": True}, "interface_endpoints needs security_groups"),
+        ({"load_balancer": True}, "load_balancer needs internet_gateway and network_acls and security_groups"),
+        ({"waf": True}, "waf needs load_balancer"),
+        ({"nat_gateways": "always"}, "nat_gateways must be one of"),
+    ],
+)
+def test_refuses_features_without_what_they_depend_on(features: dict[str, Any], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        Features(**features)
 
 
 # ── LoadBalancer
