@@ -4,12 +4,13 @@ from typing import Any
 
 import pulumi
 import pytest
-from conftest import AZS, all_of, find, registered
+from conftest import AZS, MOCKS, all_of, registered
 
 from src.address_plan import address_plan
 from src.cidr import subnet_cidr
+from src.load_balancer import SSL_POLICY, LoadBalancer, LoadBalancerArgs
 from src.nacls import nacl_rules
-from src.network import DnsFirewallSettings, Network, NetworkArgs, NetworkFirewallSettings
+from src.network import Network, NetworkArgs
 
 ARGS = NetworkArgs(
     account_id="123456789012",
@@ -19,9 +20,6 @@ ARGS = NetworkArgs(
     nat_gateways="perAz",
     app_port=8443,
     data_ports=[5432],
-    allowed_domains=["amazonaws.com"],
-    network_firewall=NetworkFirewallSettings(enabled=True, managed_rule_groups=["MalwareDomainsStrictOrder"]),
-    dns_firewall=DnsFirewallSettings(enabled=True, managed_block_list_ids=[]),
     interface_endpoints=["ssm", "ssmmessages", "sts"],
     log_retention_days=365,
 )
@@ -60,11 +58,10 @@ def test_rejects_ranges_that_dont_fit() -> None:
 # ── address_plan
 
 
-def test_lays_out_four_tiers_without_overlap() -> None:
+def test_lays_out_three_tiers_without_overlap() -> None:
     plan = address_plan("10.0.0.0/16", 3)
     assert plan.tiers["app"] == ["10.0.0.0/19", "10.0.32.0/19", "10.0.64.0/19"]
     assert plan.tiers["public"] == ["10.0.96.0/24", "10.0.97.0/24", "10.0.98.0/24"]
-    assert plan.tiers["firewall"] == ["10.0.99.0/28", "10.0.99.16/28", "10.0.99.32/28"]
     assert plan.tiers["data"] == ["10.0.100.0/22", "10.0.104.0/22", "10.0.108.0/22"]
 
     def address_range(cidr: str) -> tuple[int, int]:
@@ -101,9 +98,9 @@ def test_only_lets_the_app_tier_reach_the_data_tier_on_the_data_ports() -> None:
     assert all(r.protocol == "tcp" and r.from_port == 5432 and r.to_port == 5432 for r in from_app)
 
 
-def test_only_exposes_https_and_return_traffic_on_the_public_tier() -> None:
+def test_only_exposes_http_https_and_return_traffic_on_the_public_tier() -> None:
     ports = [f"{r.from_port}-{r.to_port}" for r in NACLS["public"].ingress]
-    assert ports == ["443-443", "1024-65535"]
+    assert ports == ["443-443", "80-80", "1024-65535"]
 
 
 def test_rejects_an_app_port_the_public_tiers_rules_wouldnt_carry() -> None:
@@ -126,18 +123,18 @@ def network() -> None:
 
 @pytest.mark.usefixtures("network")
 class TestNetwork:
-    def test_routes_public_subnets_through_the_firewall_endpoint_in_their_own_az(self) -> None:
+    def test_routes_public_subnets_straight_to_the_internet_gateway(self) -> None:
+        route = registered("aws:ec2/route:Route", "t-public-internet")
+        assert route["gatewayId"] == "t_id"
         for az in AZS:
-            route = registered("aws:ec2/route:Route", f"t-public-{az}-internet")
-            assert route["vpcEndpointId"] == f"vpce-fw-{az}"
-            assert "gatewayId" not in route
+            assoc = registered("aws:ec2/routeTableAssociation:RouteTableAssociation", f"t-public-{az}")
+            assert assoc["routeTableId"] == "t-public_id"
 
-    def test_sends_return_traffic_from_the_igw_back_through_the_same_azs_firewall(self) -> None:
-        edge = registered("aws:ec2/routeTableAssociation:RouteTableAssociation", "t-igw-edge")
-        assert edge["gatewayId"] == "t_id"
-        back = registered("aws:ec2/route:Route", "t-igw-edge-eu-west-1b")
-        assert back["destinationCidrBlock"] == "10.0.97.0/24"
-        assert back["vpcEndpointId"] == "vpce-fw-eu-west-1b"
+    def test_creates_no_network_or_dns_firewall(self) -> None:
+        leftovers = [
+            r.typ for r in MOCKS.created if r.typ.startswith(("aws:networkfirewall/", "aws:route53/resolverFirewall"))
+        ]
+        assert leftovers == []
 
     def test_sends_each_app_subnets_internet_traffic_to_the_nat_gateway_in_its_own_az(self) -> None:
         for az in AZS:
@@ -158,27 +155,6 @@ class TestNetwork:
         data_routes = [r for r in all_of("aws:ec2/route:Route") if r.inputs.get("routeTableId") == "t-data_id"]
         assert data_routes == []
 
-    def test_denies_by_default_in_the_firewall_policy(self) -> None:
-        fp = registered("aws:networkfirewall/firewallPolicy:FirewallPolicy", "t-nfw")["firewallPolicy"]
-        assert fp["statefulEngineOptions"]["ruleOrder"] == "STRICT_ORDER"
-        assert fp["statefulDefaultActions"] == ["aws:drop_established", "aws:alert_established"]
-        assert (
-            fp["statefulRuleGroupReferences"][0]["resourceArn"]
-            == "arn:aws:network-firewall:eu-west-1:aws-managed:stateful-rulegroup/MalwareDomainsStrictOrder"
-        )
-
-    def test_allow_lists_domains_and_their_subdomains(self) -> None:
-        group = registered("aws:networkfirewall/ruleGroup:RuleGroup", "t-nfw-allow-domains")
-        assert group["ruleGroup"]["rulesSource"]["rulesSourceList"]["targets"] == ["amazonaws.com", ".amazonaws.com"]
-
-    def test_runs_dns_firewall_as_a_walled_garden_that_fails_closed(self) -> None:
-        allow = registered("aws:route53/resolverFirewallRule:ResolverFirewallRule", "t-dns-allow")
-        block = registered("aws:route53/resolverFirewallRule:ResolverFirewallRule", "t-dns-block-rest")
-        assert allow["priority"] < block["priority"]
-        assert block["action"] == "BLOCK"
-        config = registered("aws:route53/resolverFirewallConfig:ResolverFirewallConfig", "t-dns")
-        assert config["firewallFailOpen"] == "DISABLED"
-
     def test_locks_down_the_default_security_group_and_network_acl(self) -> None:
         sg = registered("aws:ec2/defaultSecurityGroup:DefaultSecurityGroup", "t")
         assert sg["ingress"] == []
@@ -192,6 +168,7 @@ class TestNetwork:
         assert flow["trafficType"] == "ALL"
         assert flow["logFormat"].startswith("${version} ${account-id} ")
         group = registered("aws:cloudwatch/logGroup:LogGroup", "t-flow")
+        assert group["name"] == "/t/vpc/flow-logs"
         assert group["kmsKeyId"] == "arn:aws:mock:::t-logs"
         key = registered("aws:kms/key:Key", "t-logs")
         assert key["enableKeyRotation"] is True
@@ -213,15 +190,96 @@ class TestNetwork:
         ]
         assert data_egress == []
 
-    def test_routes_straight_to_the_igw_when_the_firewall_is_off(self) -> None:
-        build(
-            "nofw",
-            replace(
-                ARGS,
-                network_firewall=NetworkFirewallSettings(enabled=False, managed_rule_groups=[]),
-                dns_firewall=DnsFirewallSettings(enabled=False, managed_block_list_ids=[]),
-            ),
+    def test_lets_the_internet_reach_the_alb_on_80_and_443_only(self) -> None:
+        rules = [
+            r.inputs
+            for r in all_of("aws:vpc/securityGroupIngressRule:SecurityGroupIngressRule")
+            if r.inputs.get("securityGroupId") == "t-sg-alb_id"
+        ]
+        assert sorted((r["fromPort"], r["toPort"], r["cidrIpv4"]) for r in rules) == [
+            (80, 80, "0.0.0.0/0"),
+            (443, 443, "0.0.0.0/0"),
+        ]
+
+
+# ── LoadBalancer
+
+LB_ARGS = LoadBalancerArgs(
+    account_id="123456789012",
+    region="eu-west-1",
+    vpc_id="vpc-1",
+    subnet_ids=["subnet-a", "subnet-b", "subnet-c"],
+    security_group_id="sg-alb",
+    app_port=8443,
+    domain_name="app.example.com",
+    hosted_zone_name="example.com",
+    deletion_protection=False,
+    log_retention_days=365,
+)
+
+
+@pytest.fixture(scope="module")
+def load_balancer() -> None:
+    @pulumi.runtime.test
+    def run() -> None:
+        LoadBalancer("lb", LB_ARGS)
+
+    run()
+
+
+@pytest.mark.usefixtures("load_balancer")
+class TestLoadBalancer:
+    def test_is_internet_facing_in_the_public_subnets_and_drops_invalid_headers(self) -> None:
+        alb = registered("aws:lb/loadBalancer:LoadBalancer", "lb")
+        assert alb["loadBalancerType"] == "application"
+        assert alb["internal"] is False
+        assert alb["subnets"] == ["subnet-a", "subnet-b", "subnet-c"]
+        assert alb["securityGroups"] == ["sg-alb"]
+        assert alb["dropInvalidHeaderFields"] is True
+        assert alb["desyncMitigationMode"] == "strictest"
+        assert alb["accessLogs"] == {"bucket": "lb-logs_id", "prefix": "alb", "enabled": True}
+
+    def test_redirects_http_to_https_permanently(self) -> None:
+        http = registered("aws:lb/listener:Listener", "lb-http")
+        assert http["port"] == 80
+        assert http["protocol"] == "HTTP"
+        assert http["defaultActions"] == [
+            {"type": "redirect", "redirect": {"protocol": "HTTPS", "port": "443", "statusCode": "HTTP_301"}}
+        ]
+
+    def test_terminates_tls_1_2_and_1_3_with_the_validated_certificate(self) -> None:
+        https = registered("aws:lb/listener:Listener", "lb-https")
+        assert https["port"] == 443
+        assert https["protocol"] == "HTTPS"
+        assert https["sslPolicy"] == SSL_POLICY
+        assert https["certificateArn"] == "arn:aws:mock:::lb"
+        assert https["defaultActions"][0]["type"] == "fixed-response"
+        assert https["routingHttpResponseStrictTransportSecurityHeaderValue"].startswith("max-age=31536000")
+        assert https["routingHttpResponseServerEnabled"] is False
+
+    def test_validates_the_certificate_through_dns_and_points_the_domain_at_the_alb(self) -> None:
+        cert = registered("aws:acm/certificate:Certificate", "lb")
+        assert cert == {"domainName": "app.example.com", "validationMethod": "DNS"}
+        record = registered("aws:route53/record:Record", "lb-cert-validation")
+        assert record["zoneId"] == "Z-ZONE"
+        assert record["type"] == "CNAME"
+        alias = registered("aws:route53/record:Record", "lb-alias")
+        assert alias["name"] == "app.example.com"
+        assert alias["aliases"] == [{"name": "lb.elb.example", "zoneId": "Z-ALB", "evaluateTargetHealth": True}]
+
+    def test_has_an_https_target_group_on_the_app_port_ready_for_workloads(self) -> None:
+        tg = registered("aws:lb/targetGroup:TargetGroup", "lb")
+        assert (tg["port"], tg["protocol"], tg["targetType"]) == (8443, "HTTPS", "ip")
+        assert tg["healthCheck"]["protocol"] == "HTTPS"
+
+    def test_lets_only_the_elb_account_write_access_logs_over_tls(self) -> None:
+        policy = registered("aws:s3/bucketPolicy:BucketPolicy", "lb-logs")
+        statements = {s["Sid"]: s for s in json.loads(policy["policy"])["Statement"]}
+        delivery = statements["ElbLogDelivery"]
+        assert delivery["Principal"] == {"AWS": ["arn:aws:iam::156460612806:root"]}
+        assert delivery["Resource"] == ["arn:aws:mock:::lb-logs/alb/AWSLogs/123456789012/*"]
+        assert statements["DenyInsecureTransport"]["Effect"] == "Deny"
+        sse = registered(
+            "aws:s3/bucketServerSideEncryptionConfiguration:BucketServerSideEncryptionConfiguration", "lb-logs"
         )
-        route = registered("aws:ec2/route:Route", "nofw-public-eu-west-1a-internet")
-        assert route["gatewayId"] == "nofw_id"
-        assert find("aws:ec2/routeTableAssociation:RouteTableAssociation", "nofw-igw-edge") is None
+        assert sse["rules"][0]["applyServerSideEncryptionByDefault"]["sseAlgorithm"] == "AES256"

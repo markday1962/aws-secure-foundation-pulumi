@@ -1,12 +1,10 @@
 from dataclasses import asdict, dataclass
-from typing import Any, Literal
+from typing import Literal
 
 import pulumi
 import pulumi_aws as aws
 
 from .address_plan import Tier, address_plan
-from .dns_firewall import DnsFirewall, DnsFirewallArgs
-from .egress_firewall import EgressFirewall, EgressFirewallArgs, FirewallSubnet
 from .endpoints import VpcEndpoints, VpcEndpointsArgs
 from .logging import LogEncryption, LogEncryptionArgs
 from .nacls import nacl_rules
@@ -14,18 +12,6 @@ from .policy import Statement, policy_document
 from .security_groups import TierSecurityGroups, TierSecurityGroupsArgs
 
 NatMode = Literal["single", "perAz"]
-
-
-@dataclass(frozen=True)
-class NetworkFirewallSettings:
-    enabled: bool
-    managed_rule_groups: list[str]
-
-
-@dataclass(frozen=True)
-class DnsFirewallSettings:
-    enabled: bool
-    managed_block_list_ids: list[str]
 
 
 @dataclass(frozen=True)
@@ -41,10 +27,6 @@ class NetworkArgs:
     app_port: int
     # Ports the data tier listens on.
     data_ports: list[int]
-    # Domains workloads may resolve and reach. Each includes its subdomains.
-    allowed_domains: list[str]
-    network_firewall: NetworkFirewallSettings
-    dns_firewall: DnsFirewallSettings
     # Interface endpoint services, e.g. "ssm". Empty to skip interface endpoints.
     interface_endpoints: list[str]
     log_retention_days: int
@@ -52,14 +34,13 @@ class NetworkArgs:
 
 class Network(pulumi.ComponentResource):
     """
-    A four-tier VPC built for defence in depth (Well-Architected SEC05):
+    A three-tier VPC built for defence in depth (Well-Architected SEC05):
 
-      internet ⇄ IGW ⇄ [Network Firewall] ⇄ public (ALB, NAT) → app (workloads) → data (isolated)
+      internet ⇄ IGW ⇄ public (ALB, NAT) → app (workloads) → data (isolated)
 
     Every layer filters independently: route tables decide what's reachable at
-    all, network ACLs which tiers may talk, security groups which resources,
-    Network Firewall and DNS Firewall which destinations. Flow logs, firewall
-    logs and DNS query logs record it all, encrypted with a customer-managed key.
+    all, network ACLs which tiers may talk, and security groups which resources.
+    Flow logs record it all, encrypted with a customer-managed key.
     """
 
     vpc: aws.ec2.Vpc
@@ -114,29 +95,10 @@ class Network(pulumi.ComponentResource):
             "public": make_subnets("public"),
             "app": make_subnets("app"),
             "data": make_subnets("data"),
-            "firewall": make_subnets("firewall"),
         }
 
         # ── Ingress: the Internet Gateway.
         igw = aws.ec2.InternetGateway(name, vpc_id=self.vpc.id, tags=tag("igw"), opts=child_opts)
-
-        # ── Inspection: Network Firewall sits between the IGW and the public subnets.
-        firewall = (
-            EgressFirewall(
-                f"{name}-nfw",
-                EgressFirewallArgs(
-                    vpc_id=self.vpc.id,
-                    region=args.region,
-                    subnets=[FirewallSubnet(az=az, subnet=self.subnets["firewall"][i]) for i, az in enumerate(azs)],
-                    allowed_domains=args.allowed_domains,
-                    managed_rule_groups=args.network_firewall.managed_rule_groups,
-                    logs=logs,
-                ),
-                opts=child_opts,
-            )
-            if args.network_firewall.enabled
-            else None
-        )
 
         def route_table(table_id: str) -> aws.ec2.RouteTable:
             return aws.ec2.RouteTable(f"{name}-{table_id}", vpc_id=self.vpc.id, tags=tag(table_id), opts=child_opts)
@@ -146,50 +108,17 @@ class Network(pulumi.ComponentResource):
                 f"{name}-{assoc_id}", subnet_id=subnet.id, route_table_id=table.id, opts=child_opts
             )
 
-        # Firewall subnets: the only route out is the IGW.
-        firewall_table = route_table("firewall")
+        # Public subnets: straight out through the Internet Gateway.
+        public_table = route_table("public")
         aws.ec2.Route(
-            f"{name}-firewall-internet",
-            route_table_id=firewall_table.id,
+            f"{name}-public-internet",
+            route_table_id=public_table.id,
             destination_cidr_block="0.0.0.0/0",
             gateway_id=igw.id,
             opts=child_opts,
         )
         for i, az in enumerate(azs):
-            associate(f"firewall-{az}", self.subnets["firewall"][i], firewall_table)
-
-        # Public subnets: internet traffic goes through this AZ's firewall endpoint
-        # (or straight to the IGW if the firewall is off).
-        for i, az in enumerate(azs):
-            table = route_table(f"public-{az}")
-            target: dict[str, Any] = (
-                {"vpc_endpoint_id": firewall.endpoint_id(az)} if firewall else {"gateway_id": igw.id}
-            )
-            aws.ec2.Route(
-                f"{name}-public-{az}-internet",
-                route_table_id=table.id,
-                destination_cidr_block="0.0.0.0/0",
-                **target,
-                opts=child_opts,
-            )
-            associate(f"public-{az}", self.subnets["public"][i], table)
-
-        # Return traffic arriving at the IGW must also pass the firewall, so the
-        # IGW gets its own "edge" route table sending each public subnet's
-        # traffic to the same AZ's firewall endpoint (symmetric routing).
-        if firewall:
-            edge_table = route_table("igw-edge")
-            for i, az in enumerate(azs):
-                aws.ec2.Route(
-                    f"{name}-igw-edge-{az}",
-                    route_table_id=edge_table.id,
-                    destination_cidr_block=plan.tiers["public"][i],
-                    vpc_endpoint_id=firewall.endpoint_id(az),
-                    opts=child_opts,
-                )
-            aws.ec2.RouteTableAssociation(
-                f"{name}-igw-edge", gateway_id=igw.id, route_table_id=edge_table.id, opts=child_opts
-            )
+            associate(f"public-{az}", self.subnets["public"][i], public_table)
 
         # ── Egress: NAT gateways in the public subnets.
         nat_azs = azs if args.nat_gateways == "perAz" else azs[:1]
@@ -206,7 +135,7 @@ class Network(pulumi.ComponentResource):
                 )
             )
 
-        # App subnets: internet traffic via NAT (then firewall). One table per AZ
+        # App subnets: internet traffic via NAT. One table per AZ
         # so each can use its own NAT.
         app_tables: list[aws.ec2.RouteTable] = []
         for i, az in enumerate(azs):
@@ -273,19 +202,6 @@ class Network(pulumi.ComponentResource):
             opts=child_opts,
         )
 
-        # ── DNS: walled-garden filtering and query logging.
-        if args.dns_firewall.enabled:
-            DnsFirewall(
-                f"{name}-dns",
-                DnsFirewallArgs(
-                    vpc_id=self.vpc.id,
-                    allowed_domains=args.allowed_domains,
-                    managed_block_list_ids=args.dns_firewall.managed_block_list_ids,
-                    logs=logs,
-                ),
-                opts=child_opts,
-            )
-
         # ── VPC Flow Logs: every accepted and rejected flow, at one-minute granularity.
         self._flow_logs(name, args, logs)
 
@@ -293,7 +209,7 @@ class Network(pulumi.ComponentResource):
 
     def _flow_logs(self, name: str, args: NetworkArgs, logs: LogEncryption) -> None:
         child_opts = pulumi.ResourceOptions(parent=self)
-        log_group = logs.log_group(f"{name}-flow", "/learning/vpc/flow-logs")
+        log_group = logs.log_group(f"{name}-flow", f"/{name}/vpc/flow-logs")
 
         role = aws.iam.Role(
             f"{name}-flow-logs",
@@ -335,7 +251,7 @@ class Network(pulumi.ComponentResource):
             iam_role_arn=role.arn,
             max_aggregation_interval=60,
             # Version 5 fields add packet-level addresses, direction and path, which
-            # show traffic through NAT and the firewall as it really flowed.
+            # show traffic through NAT as it really flowed.
             log_format=" ".join(
                 [
                     "${version}",

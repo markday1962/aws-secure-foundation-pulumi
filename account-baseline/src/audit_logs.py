@@ -19,16 +19,21 @@ class AuditLogsArgs:
 class AuditLogs(pulumi.ComponentResource):
     """
     The account's audit trail (SEC04): a multi-region CloudTrail writing to a
-    write-once S3 bucket, encrypted with a customer-managed KMS key. AWS Config
-    delivers to the same bucket under its own prefix.
+    write-once S3 bucket, encrypted with a customer-managed KMS key, and to a
+    CloudWatch log group for the CIS metric-filter alarms. AWS Config delivers
+    to the same bucket under its own prefix. Every request to the audit bucket
+    is itself recorded by S3 server access logging.
 
-    The key and bucket are `protect`ed: they're meant to outlive this stack,
-    and Object Lock stops the logs being deleted for the retention period anyway.
+    The key and both buckets are `protect`ed: they're meant to outlive this
+    stack, and Object Lock stops the logs being deleted for the retention
+    period anyway. The key also encrypts the alert topic (see monitoring.py).
     """
 
     key: aws.kms.Key
     bucket: aws.s3.Bucket
     trail: aws.cloudtrail.Trail
+    trail_log_group: aws.cloudwatch.LogGroup
+    bucket_policy: aws.s3.BucketPolicy
 
     def __init__(self, name: str, args: AuditLogsArgs, opts: pulumi.ResourceOptions | None = None):
         super().__init__("learning:baseline:AuditLogs", name, {}, opts)
@@ -40,7 +45,7 @@ class AuditLogs(pulumi.ComponentResource):
 
         self.key = aws.kms.Key(
             name,
-            description="Encrypts CloudTrail and AWS Config logs",
+            description="Encrypts CloudTrail and AWS Config logs, and security alerts",
             enable_key_rotation=True,
             deletion_window_in_days=30,
             policy=policy_document(
@@ -72,6 +77,45 @@ class AuditLogs(pulumi.ComponentResource):
                         actions=["kms:DescribeKey"],
                         resources=["*"],
                         conditions={"StringEquals": {"aws:SourceArn": trail_arn}},
+                    ),
+                    # AWS Config (through its service-linked role) encrypts what it delivers to the bucket.
+                    Statement(
+                        sid="ConfigEncrypt",
+                        principals={"type": "Service", "identifiers": ["config.amazonaws.com"]},
+                        actions=["kms:Decrypt", "kms:GenerateDataKey"],
+                        resources=["*"],
+                        conditions={"StringEquals": {"aws:SourceAccount": args.account_id}},
+                    ),
+                    # CloudWatch Logs encrypts this account's log groups (the trail's, here).
+                    Statement(
+                        sid="CloudWatchLogsUse",
+                        principals={"type": "Service", "identifiers": [f"logs.{args.region}.amazonaws.com"]},
+                        actions=[
+                            "kms:Encrypt*",
+                            "kms:Decrypt*",
+                            "kms:ReEncrypt*",
+                            "kms:GenerateDataKey*",
+                            "kms:Describe*",
+                        ],
+                        resources=["*"],
+                        conditions={
+                            "ArnLike": {
+                                "kms:EncryptionContext:aws:logs:arn": (
+                                    f"arn:aws:logs:{args.region}:{args.account_id}:log-group:*"
+                                ),
+                            },
+                        },
+                    ),
+                    # EventBridge rules and CloudWatch alarms publish to the encrypted alert topic.
+                    Statement(
+                        sid="AlertPublishers",
+                        principals={
+                            "type": "Service",
+                            "identifiers": ["events.amazonaws.com", "cloudwatch.amazonaws.com"],
+                        },
+                        actions=["kms:Decrypt", "kms:GenerateDataKey*"],
+                        resources=["*"],
+                        conditions={"StringEquals": {"aws:SourceAccount": args.account_id}},
                     ),
                 ]
             ),
@@ -147,7 +191,9 @@ class AuditLogs(pulumi.ComponentResource):
             opts=bucket_opts,
         )
 
-        bucket_policy = aws.s3.BucketPolicy(
+        self._access_logging(name, args, keep)
+
+        self.bucket_policy = bucket_policy = aws.s3.BucketPolicy(
             name,
             bucket=self.bucket.id,
             policy=policy_document(
@@ -176,10 +222,34 @@ class AuditLogs(pulumi.ComponentResource):
                             "StringEquals": {"s3:x-amz-acl": "bucket-owner-full-control", "aws:SourceArn": trail_arn}
                         },
                     ),
+                    # AWS Config delivers with its service-linked role, so it needs the bucket's permission.
+                    Statement(
+                        sid="ConfigAclCheck",
+                        principals={"type": "Service", "identifiers": ["config.amazonaws.com"]},
+                        actions=["s3:GetBucketAcl", "s3:ListBucket"],
+                        resources=[self.bucket.arn],
+                        conditions={"StringEquals": {"aws:SourceAccount": args.account_id}},
+                    ),
+                    Statement(
+                        sid="ConfigWrite",
+                        principals={"type": "Service", "identifiers": ["config.amazonaws.com"]},
+                        actions=["s3:PutObject"],
+                        resources=[
+                            pulumi.Output.concat(self.bucket.arn, f"/config/AWSLogs/{args.account_id}/Config/*")
+                        ],
+                        conditions={
+                            "StringEquals": {
+                                "s3:x-amz-acl": "bucket-owner-full-control",
+                                "aws:SourceAccount": args.account_id,
+                            }
+                        },
+                    ),
                 ]
             ),
             opts=pulumi.ResourceOptions(parent=self, depends_on=[public_access_block]),
         )
+
+        trail_logs_role, trail_logs_policy = self._trail_log_group(name, args, trail_arn, trail_name)
 
         self.trail = aws.cloudtrail.Trail(
             name,
@@ -192,8 +262,136 @@ class AuditLogs(pulumi.ComponentResource):
             # Signed digest files prove the logs haven't been altered.
             enable_log_file_validation=True,
             kms_key_id=self.key.arn,
+            # Also to CloudWatch Logs, where the CIS metric filters watch it.
+            cloud_watch_logs_group_arn=pulumi.Output.concat(self.trail_log_group.arn, ":*"),
+            cloud_watch_logs_role_arn=trail_logs_role.arn,
             enable_logging=True,
-            opts=pulumi.ResourceOptions(parent=self, depends_on=[bucket_policy]),
+            # CloudTrail checks both its bucket and its log role when the trail is created.
+            opts=pulumi.ResourceOptions(parent=self, depends_on=[bucket_policy, trail_logs_policy]),
         )
 
         self.register_outputs({"bucket": self.bucket.id, "trailArn": self.trail.arn})
+
+    def _access_logging(self, name: str, args: AuditLogsArgs, keep: pulumi.ResourceOptions) -> None:
+        """
+        S3 server access logs for the audit bucket, so every read and delete
+        attempt on the evidence is itself recorded. The target bucket must use
+        SSE-S3: server access logging can't deliver to a KMS-encrypted bucket.
+        """
+        logs = aws.s3.Bucket(
+            f"{name}-access",
+            bucket=f"{name}-access-{args.account_id}-{args.region}",
+            force_destroy=False,
+            opts=keep,
+        )
+        logs_opts = pulumi.ResourceOptions(parent=self, depends_on=[logs])
+
+        public_access_block = aws.s3.BucketPublicAccessBlock(
+            f"{name}-access",
+            bucket=logs.id,
+            block_public_acls=True,
+            block_public_policy=True,
+            ignore_public_acls=True,
+            restrict_public_buckets=True,
+            opts=logs_opts,
+        )
+        aws.s3.BucketOwnershipControls(
+            f"{name}-access",
+            bucket=logs.id,
+            rule={"object_ownership": "BucketOwnerEnforced"},
+            opts=logs_opts,
+        )
+        aws.s3.BucketServerSideEncryptionConfiguration(
+            f"{name}-access",
+            bucket=logs.id,
+            rules=[{"apply_server_side_encryption_by_default": {"sse_algorithm": "AES256"}}],
+            opts=logs_opts,
+        )
+        aws.s3.BucketLifecycleConfiguration(
+            f"{name}-access",
+            bucket=logs.id,
+            rules=[
+                {
+                    "id": "expire-after-retention",
+                    "status": "Enabled",
+                    "filter": {},
+                    "expiration": {"days": args.retention_days},
+                }
+            ],
+            opts=logs_opts,
+        )
+        policy = aws.s3.BucketPolicy(
+            f"{name}-access",
+            bucket=logs.id,
+            policy=policy_document(
+                [
+                    Statement(
+                        sid="DenyInsecureTransport",
+                        effect="Deny",
+                        principals={"type": "AWS", "identifiers": ["*"]},
+                        actions=["s3:*"],
+                        resources=[logs.arn, pulumi.Output.concat(logs.arn, "/*")],
+                        conditions={"Bool": {"aws:SecureTransport": "false"}},
+                    ),
+                    # Only access logs for the audit bucket may be written here.
+                    Statement(
+                        sid="S3ServerAccessLogs",
+                        principals={"type": "Service", "identifiers": ["logging.s3.amazonaws.com"]},
+                        actions=["s3:PutObject"],
+                        resources=[pulumi.Output.concat(logs.arn, "/audit/*")],
+                        conditions={
+                            "StringEquals": {"aws:SourceAccount": args.account_id},
+                            "ArnLike": {"aws:SourceArn": self.bucket.arn},
+                        },
+                    ),
+                ]
+            ),
+            opts=pulumi.ResourceOptions(parent=self, depends_on=[public_access_block]),
+        )
+        aws.s3.BucketLogging(
+            name,
+            bucket=self.bucket.id,
+            target_bucket=logs.id,
+            target_prefix="audit/",
+            opts=pulumi.ResourceOptions(parent=self, depends_on=[policy]),
+        )
+
+    def _trail_log_group(
+        self, name: str, args: AuditLogsArgs, trail_arn: str, trail_name: str
+    ) -> tuple[aws.iam.Role, aws.iam.RolePolicy]:
+        """The trail's CloudWatch log group, and the role CloudTrail writes to it with."""
+        child_opts = pulumi.ResourceOptions(parent=self)
+        self.trail_log_group = aws.cloudwatch.LogGroup(
+            f"{name}-trail",
+            name=f"/aws/cloudtrail/{trail_name}",
+            retention_in_days=args.retention_days,
+            kms_key_id=self.key.arn,
+            opts=child_opts,
+        )
+        role = aws.iam.Role(
+            f"{name}-trail-logs",
+            assume_role_policy=policy_document(
+                [
+                    Statement(
+                        principals={"type": "Service", "identifiers": ["cloudtrail.amazonaws.com"]},
+                        actions=["sts:AssumeRole"],
+                        conditions={"StringEquals": {"aws:SourceArn": trail_arn}},
+                    )
+                ]
+            ),
+            opts=child_opts,
+        )
+        policy = aws.iam.RolePolicy(
+            f"{name}-trail-logs",
+            role=role.name,
+            policy=policy_document(
+                [
+                    Statement(
+                        actions=["logs:CreateLogStream", "logs:PutLogEvents"],
+                        resources=[pulumi.Output.concat(self.trail_log_group.arn, ":log-stream:*")],
+                    )
+                ]
+            ),
+            opts=child_opts,
+        )
+        return role, policy

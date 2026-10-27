@@ -14,21 +14,31 @@ class Mocks(pulumi.runtime.Mocks):
     def new_resource(self, args: pulumi.runtime.MockResourceArgs) -> tuple[str, dict[str, Any]]:
         self.created.append(args)
         state: dict[str, Any] = {**args.inputs, "arn": f"arn:aws:mock:::{args.name}"}
-        if args.typ == "aws:networkfirewall/firewall:Firewall":
-            state["firewallStatuses"] = [
+        if args.typ == "aws:acm/certificate:Certificate":
+            state["domainValidationOptions"] = [
                 {
-                    "syncStates": [
-                        {"availabilityZone": az, "attachments": [{"endpointId": f"vpce-fw-{az}", "subnetId": "x"}]}
-                        for az in AZS
-                    ]
+                    "domainName": args.inputs["domainName"],
+                    "resourceRecordName": f"_x.{args.inputs['domainName']}.",
+                    "resourceRecordType": "CNAME",
+                    "resourceRecordValue": "_y.acm-validations.aws.",
                 }
             ]
+        if args.typ == "aws:lb/loadBalancer:LoadBalancer":
+            state["dnsName"] = f"{args.name}.elb.example"
+            state["zoneId"] = "Z-ALB"
+        if args.typ == "aws:route53/record:Record":
+            state["fqdn"] = args.inputs["name"]
         if args.typ == "aws:ec2/vpc:Vpc":
             state["defaultNetworkAclId"] = "acl-default"
         return f"{args.name}_id", state
 
-    def call(self, args: pulumi.runtime.MockCallArgs) -> tuple[dict[str, Any], None]:
-        return args.args, None
+    def call(self, args: pulumi.runtime.MockCallArgs) -> tuple[dict[str, Any], list[tuple[str, str]]]:
+        # No failures. (Returning None here instead of [] crashes the mock runtime.)
+        if args.token == "aws:route53/getZone:getZone":
+            return {**args.args, "zoneId": "Z-ZONE"}, []
+        if args.token == "aws:elb/getServiceAccount:getServiceAccount":
+            return {"id": "156460612806", "arn": "arn:aws:iam::156460612806:root"}, []
+        return args.args, []
 
 
 MOCKS = Mocks()

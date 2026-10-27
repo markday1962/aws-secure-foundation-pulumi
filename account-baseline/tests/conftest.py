@@ -13,8 +13,9 @@ class Mocks(pulumi.runtime.Mocks):
         self.created.append(args)
         return f"{args.name}_id", {**args.inputs, "arn": f"arn:aws:mock:::{args.name}"}
 
-    def call(self, args: pulumi.runtime.MockCallArgs) -> tuple[dict[str, Any], None]:
-        return args.args, None
+    def call(self, args: pulumi.runtime.MockCallArgs) -> tuple[dict[str, Any], list[tuple[str, str]]]:
+        # No failures. (Returning None here instead of [] crashes the mock runtime.)
+        return args.args, []
 
 
 MOCKS = Mocks()

@@ -3,8 +3,6 @@ from dataclasses import dataclass
 import pulumi
 import pulumi_aws as aws
 
-from .policy import Statement, policy_document
-
 
 @dataclass(frozen=True)
 class DetectionArgs:
@@ -13,6 +11,8 @@ class DetectionArgs:
     # Where AWS Config delivers configuration snapshots and history.
     log_bucket: aws.s3.Bucket
     log_key: aws.kms.Key
+    # The bucket policy that lets AWS Config deliver; delivery is checked when the channel is created.
+    log_bucket_policy: aws.s3.BucketPolicy
 
 
 GUARDDUTY_FEATURES = [
@@ -38,40 +38,10 @@ class Detection(pulumi.ComponentResource):
         child_opts = pulumi.ResourceOptions(parent=self)
 
         # ── AWS Config: the inventory and change history Security Hub evaluates.
-        config_role = aws.iam.Role(
-            f"{name}-config",
-            assume_role_policy=policy_document(
-                [
-                    Statement(
-                        principals={"type": "Service", "identifiers": ["config.amazonaws.com"]},
-                        actions=["sts:AssumeRole"],
-                        conditions={"StringEquals": {"aws:SourceAccount": args.account_id}},
-                    )
-                ]
-            ),
-            opts=child_opts,
-        )
-        aws.iam.RolePolicyAttachment(
-            f"{name}-config",
-            role=config_role.name,
-            policy_arn="arn:aws:iam::aws:policy/service-role/AWS_ConfigRole",
-            opts=child_opts,
-        )
-        aws.iam.RolePolicy(
-            f"{name}-config-delivery",
-            role=config_role.name,
-            policy=policy_document(
-                [
-                    Statement(actions=["s3:GetBucketAcl"], resources=[args.log_bucket.arn]),
-                    Statement(
-                        actions=["s3:PutObject"],
-                        resources=[pulumi.Output.concat(args.log_bucket.arn, f"/config/AWSLogs/{args.account_id}/*")],
-                        conditions={"StringEquals": {"s3:x-amz-acl": "bucket-owner-full-control"}},
-                    ),
-                    Statement(actions=["kms:GenerateDataKey", "kms:Decrypt"], resources=[args.log_key.arn]),
-                ]
-            ),
-            opts=child_opts,
+        # It records with its service-linked role (Security Hub control Config.1);
+        # the audit bucket and key policies let the service deliver.
+        config_role = aws.iam.ServiceLinkedRole(
+            f"{name}-config", aws_service_name="config.amazonaws.com", opts=child_opts
         )
 
         recorder = aws.cfg.Recorder(
@@ -89,7 +59,7 @@ class Detection(pulumi.ComponentResource):
             s3_key_prefix="config",
             s3_kms_key_arn=args.log_key.arn,
             snapshot_delivery_properties={"delivery_frequency": "TwentyFour_Hours"},
-            opts=pulumi.ResourceOptions(parent=self, depends_on=[recorder]),
+            opts=pulumi.ResourceOptions(parent=self, depends_on=[recorder, args.log_bucket_policy]),
         )
         recording = aws.cfg.RecorderStatus(
             name,

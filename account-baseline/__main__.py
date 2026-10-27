@@ -5,9 +5,18 @@ import pulumi
 from src.audit_logs import AuditLogs, AuditLogsArgs
 from src.detection import Detection, DetectionArgs
 from src.hardening import Hardening, HardeningArgs
+from src.monitoring import Monitoring, MonitoringArgs
 
 config = pulumi.Config()
 aws_config = pulumi.Config("aws")
+
+# Every physical name (buckets, trail, log groups, KMS aliases, security
+# groups, the ALB) starts with this, so stacks can share an account. The ALB's
+# 32-character name limit caps the stack name at 10 characters.
+stack = pulumi.get_stack()
+if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,9}", stack):
+    raise ValueError(f'stack name must be 1-10 lowercase letters, digits or hyphens, got "{stack}"')
+prefix = f"learning-{stack}"
 
 # The account this stack is pinned to. The provider refuses to run against
 # any other, and policies use it to scope access to this account only.
@@ -22,7 +31,7 @@ if object_lock_mode not in ("GOVERNANCE", "COMPLIANCE"):
     raise ValueError(f'objectLockMode must be GOVERNANCE or COMPLIANCE, got "{object_lock_mode}"')
 
 audit = AuditLogs(
-    "learning-audit",
+    f"{prefix}-audit",
     AuditLogsArgs(
         account_id=account_id,
         region=region,
@@ -32,12 +41,29 @@ audit = AuditLogs(
 )
 
 Detection(
-    "learning-detection",
-    DetectionArgs(account_id=account_id, region=region, log_bucket=audit.bucket, log_key=audit.key),
+    f"{prefix}-detection",
+    DetectionArgs(
+        account_id=account_id,
+        region=region,
+        log_bucket=audit.bucket,
+        log_key=audit.key,
+        log_bucket_policy=audit.bucket_policy,
+    ),
 )
 
-Hardening("learning-hardening", HardeningArgs(imds_hop_limit=config.get_int("imdsHopLimit", default=1)))
+monitoring = Monitoring(
+    f"{prefix}-alerts",
+    MonitoringArgs(
+        account_id=account_id,
+        key=audit.key,
+        trail_log_group=audit.trail_log_group,
+        alert_email=config.get("alertEmail"),
+    ),
+)
+
+Hardening(f"{prefix}-hardening", HardeningArgs(imds_hop_limit=config.get_int("imdsHopLimit", default=1)))
 
 pulumi.export("auditBucket", audit.bucket.id)
 pulumi.export("auditKeyArn", audit.key.arn)
 pulumi.export("trailArn", audit.trail.arn)
+pulumi.export("alertTopicArn", monitoring.topic.arn)
