@@ -143,6 +143,10 @@ group and NACL limit it to port 443, and nothing more.
 
 Needs Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
+GitHub Actions (`.github/workflows/ci.yml`) runs the same checks on every pull
+request and every push to `main`: for each project, `uv sync --locked`, ruff
+format and lint, pyright and pytest. It never touches AWS.
+
 ```sh
 make install                              # a .venv in each project
 make test                                 # 46 unit tests across both projects, no AWS needed

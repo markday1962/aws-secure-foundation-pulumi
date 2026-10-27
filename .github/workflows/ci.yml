@@ -1,0 +1,58 @@
+# Tests and code quality for both Pulumi projects. Nothing here touches AWS:
+# the unit tests run against Pulumi mocks.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Read the code, nothing more.
+permissions:
+  contents: read
+
+# A newer push to the same branch or PR supersedes the run in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: ${{ matrix.project }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [account-baseline, network]
+    defaults:
+      run:
+        working-directory: ${{ matrix.project }}
+    steps:
+      # Third-party actions are pinned to commit SHAs; the comment is the release.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.10.7"
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: ${{ matrix.project }}/uv.lock
+
+      # --locked fails if uv.lock is out of date with pyproject.toml.
+      - name: Install
+        run: uv sync --locked
+
+      - name: Format
+        run: uv run ruff format --check .
+
+      - name: Lint
+        run: uv run ruff check --output-format=github .
+
+      - name: Type check
+        run: uv run pyright
+
+      - name: Test
+        run: uv run pytest
