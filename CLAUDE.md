@@ -33,6 +33,8 @@ isn't linted, so lint an uncommented copy.
 - Branch from an up-to-date `main` (`feat/…`, `chore/…`), one commit per
   logical step, then open a PR, wait for CI, merge with a **merge commit**
   (not squash), confirm CI passes on `main`, and delete the branch.
+- `/ship` (`.claude/skills/ship/SKILL.md`) runs that whole sequence for the
+  current branch; `/ship review` stops once CI passes, before merging.
 - Commit, push, open PRs and merge only when asked.
 - The repository is **public**: never commit real account IDs, secrets,
   passphrases or state. The `111111111111` account and `example.com` domain
